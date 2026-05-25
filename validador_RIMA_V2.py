@@ -3,24 +3,16 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime
+import re
 
-# Aircraft capacity dictionary
+# ─────────────────────────────────────────────────────────────
+# CONSTANTES
+# ─────────────────────────────────────────────────────────────
+
 AIRCRAFT_CAPACITY = {
-    'C208': 9,
-    'E295': 136,
-    'A319': 144,
-    'A320': 180,
-    'A321': 224,
-    'A20N': 180,
-    '32Q': 180,
-    'A332': 268,
-    '339': 298,
-    'AT72': 72,
-    'E195': 118,
-    'B738': 186,
-    'B737': 138,
-    'B738W': 186,
-    'AT76': 72,
+    'C208': 9, 'E295': 136, 'A319': 144, 'A320': 180, 'A321': 224,
+    'A20N': 180, '32Q': 180, 'A332': 268, '339': 298, 'AT72': 72,
+    'E195': 118, 'B738': 186, 'B737': 138, 'B738W': 186, 'AT76': 72,
     'A21N': 224
 }
 
@@ -38,8 +30,430 @@ PONTE_COLORS = {
     'Sem Passageiros pelo Terminal': '#95A5A6'
 }
 
+# Campos obrigatórios conforme portaria (campo → descrição amigável)
+CAMPOS_OBRIGATORIOS = {
+    'COD_RIMA': 'Cód. RIMA (Campo 1)',
+    'MOVIMENTO_TIPO': 'Tipo de Movimento (Campo 2)',
+    'AERONAVE_MARCAS': 'Marcas da Aeronave (Campo 3)',
+    'AERONAVE_TIPO': 'Tipo de Aeronave (Campo 4)',
+    'AERONAVE_OPERADOR': 'Operador (Campo 5)',
+    'VOO_OUTRO_AEROPORTO': 'Aeroporto Anterior/Posterior (Campo 6)',
+    'VOO_NUMERO': 'Número do Voo (Campo 7)',
+    'SERVICE_TYPE': 'Tipo de Serviço (Campo 8)',
+    'NATUREZA': 'Natureza (Campo 9)',
+    'PREVISTO_DATA': 'Data Prevista (Campo 10)',
+    'PREVISTO_HORARIO': 'Horário Previsto (Campo 11)',
+    'CALCO_DATA': 'Data Calço (Campo 12)',
+    'CALCO_HORARIO': 'Horário Calço (Campo 13)',
+    'TOQUE_DATA': 'Data Toque (Campo 14)',
+    'TOQUE_HORARIO': 'Horário Toque (Campo 15)',
+    'CABECEIRA': 'Cabeceira (Campo 16)',
+    'BOX': 'Box/Posição Pátio (Campo 17)',
+    'PONTE_CONECTOR_REMOTA': 'Ponte/Conector (Campo 18)',
+    'TERMINAL': 'Terminal (Campo 19)',
+    'PAX_LOCAL': 'PAX Local (Campo 20)',
+    'PAX_CONEXAO_DOMESTICO': 'PAX Conexão Doméstico (Campo 21)',
+    'PAX_CONEXAO_INTERNACIONAL': 'PAX Conexão Internacional (Campo 22)',
+    'CORREIO': 'Correio kg (Campo 23)',
+    'CARGA': 'Carga kg (Campo 24)',
+}
+
+# Campos opcionais (25 e 26) — validados se presentes, mas não exigidos
+CAMPOS_OPCIONAIS = {
+    'RETORNO_ALTERNADO': 'Retorno/Alternado (Campo 25)',
+    'CONTESTACAO': 'Contestação (Campo 26)',
+}
+
+# Valores válidos por campo (enumerados)
+VALORES_VALIDOS = {
+    'MOVIMENTO_TIPO': ['P', 'D'],
+    'NATUREZA': ['D', 'I'],
+    'PONTE_CONECTOR_REMOTA': [1, 2, 3, 4],
+    'RETORNO_ALTERNADO': ['R', 'A', 'N', '', None],
+    'CONTESTACAO': ['NE', 'NC', 'CO', 'DV', '', None],
+    'SERVICE_TYPE': [
+        'J', 'C', 'F', 'H', 'W', 'G', 'P', 'Q', 'T', 'M', 'X',
+        'I', 'E', 'A', 'N', 'B', 'D', 'K', 'L', 'O', 'R', 'S',
+        'U', 'V', 'Y', 'Z'
+    ],
+}
+
+# Regex de formato
+RE_DATA = re.compile(r'^\d{2}/\d{2}/\d{4}$')
+RE_HORARIO = re.compile(r'^\d{2}:\d{2}$')
+RE_OACI_ICAO = re.compile(r'^[A-Z]{4}$')         # aeroporto OACI
+RE_OACI_OPERADOR = re.compile(r'^[A-Z0-9]{2,3}$')  # designador de operador
+
+
+# ─────────────────────────────────────────────────────────────
+# VALIDAÇÃO DE CAMPOS — NOVA FUNÇÃO PRINCIPAL
+# ─────────────────────────────────────────────────────────────
+
+def validate_fields(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Executa todas as validações de campos (obrigatórios, formatos e regras
+    de negócio dos metadados do RIMA). Retorna um DataFrame de erros com
+    colunas: LINHA, CAMPO, DESCRICAO_CAMPO, VALOR_ENCONTRADO, TIPO_ERRO, DETALHE.
+    """
+    errors = []
+
+    def add_error(idx, campo, descricao, valor, tipo, detalhe):
+        errors.append({
+            'LINHA': idx + 2,          # +2: 1-indexed + cabeçalho
+            'CAMPO': campo,
+            'DESCRICAO_CAMPO': descricao,
+            'VALOR_ENCONTRADO': str(valor) if pd.notna(valor) else '(vazio)',
+            'TIPO_ERRO': tipo,
+            'DETALHE': detalhe,
+        })
+
+    def is_blank(val):
+        if val is None:
+            return True
+        if isinstance(val, float) and pd.isna(val):
+            return True
+        if isinstance(val, str) and val.strip() == '':
+            return True
+        return False
+
+    def valid_date(val):
+        if is_blank(val):
+            return False
+        s = str(val).strip()
+        if not RE_DATA.match(s):
+            return False
+        try:
+            datetime.strptime(s, '%d/%m/%Y')
+            return True
+        except ValueError:
+            return False
+
+    def valid_time(val):
+        if is_blank(val):
+            return False
+        s = str(val).strip()
+        if not RE_HORARIO.match(s):
+            return False
+        h, m = s.split(':')
+        return 0 <= int(h) <= 23 and 0 <= int(m) <= 59
+
+    for idx, row in df.iterrows():
+
+        # ── 1. Campos obrigatórios: nulos/vazios ────────────────────────────
+        for campo, desc in CAMPOS_OBRIGATORIOS.items():
+            if campo not in df.columns:
+                continue
+            val = row.get(campo)
+            if is_blank(val):
+                add_error(idx, campo, desc, val, 'CAMPO VAZIO', f'{desc} é obrigatório e está vazio/nulo.')
+
+        # ── 2. Campo 2 – MOVIMENTO_TIPO: apenas 'P' ou 'D' ──────────────────
+        val = row.get('MOVIMENTO_TIPO')
+        if not is_blank(val) and str(val).strip() not in VALORES_VALIDOS['MOVIMENTO_TIPO']:
+            add_error(idx, 'MOVIMENTO_TIPO', CAMPOS_OBRIGATORIOS.get('MOVIMENTO_TIPO', 'Tipo Movimento'),
+                      val, 'VALOR INVÁLIDO', f"Esperado 'P' ou 'D'. Encontrado: '{val}'.")
+
+        # ── 3. Campo 6 – VOO_OUTRO_AEROPORTO: formato OACI (4 letras maiúsculas)
+        val = row.get('VOO_OUTRO_AEROPORTO')
+        if not is_blank(val):
+            s = str(val).strip()
+            if s not in ('0', 'ZZZZ') and not RE_OACI_ICAO.match(s):
+                add_error(idx, 'VOO_OUTRO_AEROPORTO',
+                          CAMPOS_OBRIGATORIOS.get('VOO_OUTRO_AEROPORTO', 'Aeroporto Ant/Post'),
+                          val, 'FORMATO INVÁLIDO',
+                          f"Código OACI deve ter 4 letras maiúsculas. Encontrado: '{val}'.")
+
+        # ── 4. Campo 7 – VOO_NUMERO: numérico ───────────────────────────────
+        val = row.get('VOO_NUMERO')
+        if not is_blank(val):
+            try:
+                int(float(str(val).strip()))
+            except ValueError:
+                add_error(idx, 'VOO_NUMERO', CAMPOS_OBRIGATORIOS.get('VOO_NUMERO', 'Nº Voo'),
+                          val, 'FORMATO INVÁLIDO', f"Deve ser numérico. Encontrado: '{val}'.")
+
+        # ── 5. Campo 8 – SERVICE_TYPE: valores IATA + Y/Z ───────────────────
+        val = row.get('SERVICE_TYPE')
+        if not is_blank(val):
+            s = str(val).strip().upper()
+            if s not in [v.upper() for v in VALORES_VALIDOS['SERVICE_TYPE']]:
+                add_error(idx, 'SERVICE_TYPE', CAMPOS_OBRIGATORIOS.get('SERVICE_TYPE', 'Tipo Serviço'),
+                          val, 'VALOR INVÁLIDO',
+                          f"SERVICE_TYPE '{val}' não consta no SSIM IATA nem nos códigos padrão Y/Z.")
+
+        # ── 6. Campo 9 – NATUREZA: 'D' ou 'I' ───────────────────────────────
+        val = row.get('NATUREZA')
+        if not is_blank(val) and str(val).strip() not in VALORES_VALIDOS['NATUREZA']:
+            add_error(idx, 'NATUREZA', CAMPOS_OBRIGATORIOS.get('NATUREZA', 'Natureza'),
+                      val, 'VALOR INVÁLIDO', f"Esperado 'D' (doméstico) ou 'I' (internacional). Encontrado: '{val}'.")
+
+        # ── 7. Campos de DATA: formato DD/MM/AAAA ────────────────────────────
+        for campo in ['PREVISTO_DATA', 'CALCO_DATA', 'TOQUE_DATA']:
+            desc = CAMPOS_OBRIGATORIOS.get(campo, campo)
+            val = row.get(campo)
+            if not is_blank(val):
+                s = str(val).strip()
+                # Se já foi convertido para Timestamp pelo pandas, formata e verifica
+                if hasattr(val, 'strftime'):
+                    pass  # datetime válido
+                elif not valid_date(s):
+                    add_error(idx, campo, desc, val, 'FORMATO INVÁLIDO',
+                              f"Data deve ser DD/MM/AAAA. Encontrado: '{val}'.")
+
+        # ── 8. Campos de HORÁRIO: formato HH:MM ──────────────────────────────
+        for campo in ['PREVISTO_HORARIO', 'CALCO_HORARIO', 'TOQUE_HORARIO']:
+            desc = CAMPOS_OBRIGATORIOS.get(campo, campo)
+            val = row.get(campo)
+            if not is_blank(val):
+                s = str(val).strip()
+                if not valid_time(s):
+                    add_error(idx, campo, desc, val, 'FORMATO INVÁLIDO',
+                              f"Horário deve ser HH:MM (00-23:00-59). Encontrado: '{val}'.")
+
+        # ── 9. Campo 17 – BOX: N/A ou valor cadastrado (não vazio) ──────────
+        val = row.get('BOX')
+        if is_blank(val):
+            add_error(idx, 'BOX', CAMPOS_OBRIGATORIOS.get('BOX', 'Box Pátio'),
+                      val, 'CAMPO VAZIO',
+                      "Campo BOX deve ser preenchido com o identificador da posição ou 'N/A'.")
+
+        # ── 10. Campo 18 – PONTE_CONECTOR_REMOTA: 1, 2, 3 ou 4 ──────────────
+        val = row.get('PONTE_CONECTOR_REMOTA')
+        if not is_blank(val):
+            try:
+                v = int(float(str(val).strip()))
+                if v not in VALORES_VALIDOS['PONTE_CONECTOR_REMOTA']:
+                    add_error(idx, 'PONTE_CONECTOR_REMOTA',
+                              CAMPOS_OBRIGATORIOS.get('PONTE_CONECTOR_REMOTA', 'Ponte/Conector'),
+                              val, 'VALOR INVÁLIDO', f"Esperado 1, 2, 3 ou 4. Encontrado: '{val}'.")
+            except ValueError:
+                add_error(idx, 'PONTE_CONECTOR_REMOTA',
+                          CAMPOS_OBRIGATORIOS.get('PONTE_CONECTOR_REMOTA', 'Ponte/Conector'),
+                          val, 'FORMATO INVÁLIDO', f"Deve ser numérico (1-4). Encontrado: '{val}'.")
+
+        # ── 11. Campo 19 – TERMINAL: N/A ou valor preenchido ─────────────────
+        val = row.get('TERMINAL')
+        if is_blank(val):
+            add_error(idx, 'TERMINAL', CAMPOS_OBRIGATORIOS.get('TERMINAL', 'Terminal'),
+                      val, 'CAMPO VAZIO',
+                      "Campo TERMINAL deve ser preenchido com o identificador ou 'N/A'.")
+
+        # ── 12. Campos numéricos PAX/CARGA/CORREIO: >= 0 ─────────────────────
+        for campo in ['PAX_LOCAL', 'PAX_CONEXAO_DOMESTICO', 'PAX_CONEXAO_INTERNACIONAL',
+                      'CORREIO', 'CARGA']:
+            desc = CAMPOS_OBRIGATORIOS.get(campo, campo)
+            val = row.get(campo)
+            if not is_blank(val):
+                try:
+                    n = float(str(val).strip())
+                    if n < 0:
+                        add_error(idx, campo, desc, val, 'VALOR INVÁLIDO',
+                                  f"Valores negativos não são permitidos. Encontrado: {val}.")
+                except ValueError:
+                    add_error(idx, campo, desc, val, 'FORMATO INVÁLIDO',
+                              f"Deve ser numérico (≥ 0). Encontrado: '{val}'.")
+
+        # ── 13. Campo 25 – RETORNO_ALTERNADO: R, A, N ou vazio (opcional) ────
+        val = row.get('RETORNO_ALTERNADO')
+        if not is_blank(val) and str(val).strip() not in ['R', 'A', 'N', '']:
+            add_error(idx, 'RETORNO_ALTERNADO',
+                      CAMPOS_OPCIONAIS.get('RETORNO_ALTERNADO', 'Retorno/Alternado'),
+                      val, 'VALOR INVÁLIDO',
+                      f"Esperado 'R', 'A', 'N' ou vazio. Encontrado: '{val}'.")
+
+        # ── 14. Campo 26 – CONTESTACAO: NE, NC, CO, DV ou vazio (opcional) ───
+        val = row.get('CONTESTACAO')
+        if not is_blank(val) and str(val).strip() not in ['NE', 'NC', 'CO', 'DV', '']:
+            add_error(idx, 'CONTESTACAO',
+                      CAMPOS_OPCIONAIS.get('CONTESTACAO', 'Contestação'),
+                      val, 'VALOR INVÁLIDO',
+                      f"Esperado 'NE', 'NC', 'CO', 'DV' ou vazio. Encontrado: '{val}'.")
+
+        # ── 15. Consistência SERVICE_TYPE x RETORNO_ALTERNADO ────────────────
+        st_val = str(row.get('SERVICE_TYPE', '') or '').strip().upper()
+        ra_val = str(row.get('RETORNO_ALTERNADO', '') or '').strip().upper()
+        if st_val == 'Y' and ra_val not in ('A', ''):
+            add_error(idx, 'RETORNO_ALTERNADO',
+                      CAMPOS_OPCIONAIS.get('RETORNO_ALTERNADO', 'Retorno/Alternado'),
+                      ra_val, 'INCONSISTÊNCIA',
+                      "SERVICE_TYPE='Y' (alternado) mas RETORNO_ALTERNADO não é 'A'.")
+        if st_val == 'Z' and ra_val not in ('R', ''):
+            add_error(idx, 'RETORNO_ALTERNADO',
+                      CAMPOS_OPCIONAIS.get('RETORNO_ALTERNADO', 'Retorno/Alternado'),
+                      ra_val, 'INCONSISTÊNCIA',
+                      "SERVICE_TYPE='Z' (retorno) mas RETORNO_ALTERNADO não é 'R'.")
+
+        # ── 16. Consistência NATUREZA x AERONAVE_MARCAS ──────────────────────
+        # Matrícula brasileira começa com PS-, PP-, PR-, PT-, PU-
+        marcas = str(row.get('AERONAVE_MARCAS', '') or '').strip().upper()
+        natureza = str(row.get('NATUREZA', '') or '').strip().upper()
+        br_prefix = marcas[:2] in ('PS', 'PP', 'PR', 'PT', 'PU')
+        if natureza == 'D' and marcas and not br_prefix:
+            add_error(idx, 'NATUREZA', CAMPOS_OBRIGATORIOS.get('NATUREZA', 'Natureza'),
+                      natureza, 'INCONSISTÊNCIA',
+                      f"NATUREZA='D' (doméstico) mas matrícula '{marcas}' parece estrangeira.")
+        if natureza == 'I' and marcas and br_prefix:
+            # NATUREZA='I' com matrícula BR é possível (fretamento p/ exterior),
+            # então apenas aviso, não erro.
+            add_error(idx, 'NATUREZA', CAMPOS_OBRIGATORIOS.get('NATUREZA', 'Natureza'),
+                      natureza, 'AVISO',
+                      f"NATUREZA='I' com matrícula brasileira '{marcas}' — verificar se é fretamento internacional.")
+
+    errors_df = pd.DataFrame(errors, columns=[
+        'LINHA', 'CAMPO', 'DESCRICAO_CAMPO', 'VALOR_ENCONTRADO', 'TIPO_ERRO', 'DETALHE'
+    ])
+    return errors_df
+
+
+def render_tab_campos(df: pd.DataFrame):
+    """Renderiza a aba de Validação de Campos no Streamlit."""
+    st.subheader('Validação de Campos — Obrigatórios, Formatos e Regras de Negócio')
+    st.caption(
+        "Baseado na Portaria nº 2.176/SRA/SIA e nos metadados do RIMA (Campos 1–26). "
+        "Campos opcionais (25 e 26) são validados quando preenchidos."
+    )
+
+    with st.spinner('Executando validações de campos...'):
+        erros_df = validate_fields(df)
+
+    total_erros = len(erros_df)
+    total_linhas = len(df)
+
+    if total_erros == 0:
+        st.success(f'✅ Nenhum erro de campo encontrado nas {total_linhas} operações.')
+        return
+
+    # ── KPIs ──────────────────────────────────────────────────────────────
+    linhas_com_erro = erros_df['LINHA'].nunique()
+    campos_afetados = erros_df['CAMPO'].nunique()
+
+    tipo_counts = erros_df['TIPO_ERRO'].value_counts()
+
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric('Total de Erros', total_erros)
+    col2.metric('Linhas com Erro', f'{linhas_com_erro} / {total_linhas}',
+                f'{linhas_com_erro / total_linhas * 100:.1f}%')
+    col3.metric('Campos Afetados', campos_afetados)
+    col4.metric('Campos Vazios', int(tipo_counts.get('CAMPO VAZIO', 0)), delta_color='inverse')
+    col5.metric('Formato/Valor Inválido',
+                int(tipo_counts.get('FORMATO INVÁLIDO', 0) + tipo_counts.get('VALOR INVÁLIDO', 0)),
+                delta_color='inverse')
+
+    st.markdown('---')
+
+    # ── Gráfico: erros por campo ───────────────────────────────────────────
+    erros_por_campo = (
+        erros_df.groupby(['CAMPO', 'TIPO_ERRO'])
+        .size()
+        .reset_index(name='Quantidade')
+    )
+    fig_campos = px.bar(
+        erros_por_campo,
+        x='CAMPO', y='Quantidade', color='TIPO_ERRO',
+        title='Erros por Campo e Tipo',
+        template='plotly_white',
+        barmode='stack',
+        color_discrete_map={
+            'CAMPO VAZIO': '#E74C3C',
+            'FORMATO INVÁLIDO': '#E67E22',
+            'VALOR INVÁLIDO': '#F39C12',
+            'INCONSISTÊNCIA': '#8E44AD',
+            'AVISO': '#3498DB',
+        }
+    )
+    fig_campos.update_layout(
+        plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
+        font=dict(color='#2C3E50'), xaxis_tickangle=-35,
+        xaxis_title='Campo', yaxis_title='Quantidade de Erros',
+        legend_title='Tipo de Erro'
+    )
+    st.plotly_chart(fig_campos, use_container_width=True)
+
+    # ── Gráfico: distribuição por tipo de erro ─────────────────────────────
+    fig_tipo = px.pie(
+        tipo_counts.reset_index().rename(columns={'index': 'Tipo', 'TIPO_ERRO': 'Tipo', 'count': 'Quantidade'}),
+        names='TIPO_ERRO', values='count' if 'count' in tipo_counts.reset_index().columns else 'TIPO_ERRO',
+        title='Distribuição por Tipo de Erro',
+        color_discrete_sequence=['#E74C3C', '#E67E22', '#F39C12', '#8E44AD', '#3498DB'],
+        hole=0.4
+    )
+    # Garante compatibilidade com versões do plotly
+    tc = tipo_counts.reset_index()
+    tc.columns = ['Tipo', 'Quantidade']
+    fig_tipo = px.pie(
+        tc, names='Tipo', values='Quantidade',
+        title='Distribuição por Tipo de Erro',
+        color='Tipo',
+        color_discrete_map={
+            'CAMPO VAZIO': '#E74C3C',
+            'FORMATO INVÁLIDO': '#E67E22',
+            'VALOR INVÁLIDO': '#F39C12',
+            'INCONSISTÊNCIA': '#8E44AD',
+            'AVISO': '#3498DB',
+        },
+        hole=0.4
+    )
+    fig_tipo.update_layout(
+        plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
+        font=dict(color='#2C3E50')
+    )
+
+    col_g1, col_g2 = st.columns([2, 1])
+    with col_g1:
+        st.plotly_chart(fig_campos, use_container_width=True)
+    with col_g2:
+        st.plotly_chart(fig_tipo, use_container_width=True)
+
+    st.markdown('---')
+
+    # ── Filtros interativos ────────────────────────────────────────────────
+    col_f1, col_f2 = st.columns(2)
+    with col_f1:
+        tipos_disponiveis = sorted(erros_df['TIPO_ERRO'].unique().tolist())
+        tipo_selecionado = st.multiselect(
+            'Filtrar por Tipo de Erro:', tipos_disponiveis,
+            default=tipos_disponiveis, key='campo_tipo_filter'
+        )
+    with col_f2:
+        campos_disponiveis = sorted(erros_df['CAMPO'].unique().tolist())
+        campo_selecionado = st.multiselect(
+            'Filtrar por Campo:', campos_disponiveis,
+            default=campos_disponiveis, key='campo_campo_filter'
+        )
+
+    erros_filtrado = erros_df[
+        erros_df['TIPO_ERRO'].isin(tipo_selecionado) &
+        erros_df['CAMPO'].isin(campo_selecionado)
+    ].sort_values(['TIPO_ERRO', 'CAMPO', 'LINHA'])
+
+    st.write(f'#### Registros de Erro ({len(erros_filtrado)} ocorrências)')
+    st.dataframe(erros_filtrado, hide_index=True, use_container_width=True)
+
+    # ── Resumo por campo ───────────────────────────────────────────────────
+    st.write('#### Resumo por Campo')
+    resumo = (
+        erros_df.groupby(['CAMPO', 'DESCRICAO_CAMPO', 'TIPO_ERRO'])
+        .size()
+        .reset_index(name='Ocorrências')
+        .sort_values(['TIPO_ERRO', 'Ocorrências'], ascending=[True, False])
+    )
+    st.dataframe(resumo, hide_index=True, use_container_width=True)
+
+    # ── Download ───────────────────────────────────────────────────────────
+    csv_erros = erros_df.to_csv(index=False, sep=';').encode('utf-8-sig')
+    st.download_button(
+        '⬇️ Baixar Erros de Campos (CSV)',
+        data=csv_erros,
+        file_name='erros_campos_rima.csv',
+        mime='text/csv'
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# FUNÇÕES ORIGINAIS (mantidas integralmente)
+# ─────────────────────────────────────────────────────────────
+
 def format_date(date_val):
-    """Helper function to safely format dates"""
     try:
         if isinstance(date_val, str):
             return pd.to_datetime(date_val).strftime('%d/%m/%Y')
@@ -49,26 +463,18 @@ def format_date(date_val):
     except:
         return str(date_val)
 
+
 def generate_validation_report(df):
-    """
-    Generate a text report summarizing all validations.
-    """
     report = []
-    
-    # Cabeçalho
     report.append("RELATÓRIO DE VALIDAÇÕES")
     report.append("=" * 50)
     report.append("")
-
-    # 1. Resumo Geral
     report.append("1. RESUMO GERAL")
     report.append("-" * 20)
     total_flights = len(df)
     report.append(f"Total de Operações: {total_flights}")
     report.append(f"Total de Passageiros: {int(df['TOTAL_PAX'].sum()):,}")
     report.append("")
-
-    # 2. Validação de Capacidade
     report.append("2. VALIDAÇÃO DE CAPACIDADE")
     report.append("-" * 20)
     capacity_violations = df[df['EXCEEDS_CAPACITY']].copy()
@@ -86,8 +492,6 @@ def generate_validation_report(df):
                 f"Excesso: {excesso}"
             )
     report.append("")
-
-    # 3. Validação Aviação Geral
     report.append("3. VALIDAÇÃO AVIAÇÃO GERAL")
     report.append("-" * 20)
     geral_violations = df[df['GERAL_PAX_VIOLATION']].copy()
@@ -101,8 +505,6 @@ def generate_validation_report(df):
                 f"Total PAX: {row['TOTAL_PAX']}"
             )
     report.append("")
-
-    # 4. Validação RPE em Branco
     report.append("4. VALIDAÇÃO RPE EM BRANCO")
     report.append("-" * 20)
     rpe_violations = df[df['RPE_BRANCO_VIOLATION']].copy()
@@ -116,8 +518,6 @@ def generate_validation_report(df):
                 f"Operador: {row['AERONAVE_OPERADOR']}"
             )
     report.append("")
-
-    # 5. Uso de Ponte de Embarque
     report.append("5. USO DE PONTE DE EMBARQUE")
     report.append("-" * 20)
     if 'PONTE_LABEL' in df.columns:
@@ -130,33 +530,31 @@ def generate_validation_report(df):
                         (~df['PONTE_CONECTOR_REMOTA'].isin([1, 2, 3, 4])).sum()
         report.append(f"Valores inválidos/ausentes: {invalid_ponte}")
     report.append("")
-
-    # 6. Estatísticas Finais
     report.append("6. ESTATÍSTICAS FINAIS")
     report.append("-" * 20)
-    report.append(f"Percentual de voos com alguma violação: {(len(df[df['EXCEEDS_CAPACITY'] | df['GERAL_PAX_VIOLATION'] | df['RPE_BRANCO_VIOLATION'] | df['HORARIO_INVALIDO']]) / len(df) * 100):.1f}%")
-    
+    report.append(
+        f"Percentual de voos com alguma violação: "
+        f"{(len(df[df['EXCEEDS_CAPACITY'] | df['GERAL_PAX_VIOLATION'] | df['RPE_BRANCO_VIOLATION'] | df['HORARIO_INVALIDO']]) / len(df) * 100):.1f}%"
+    )
     return "\n".join(report)
 
 
 def validate_passenger_count(df):
-    """Validate passenger counts and add necessary columns for analysis."""
     df['AIRCRAFT_CAPACITY'] = df['AERONAVE_TIPO'].map(AIRCRAFT_CAPACITY)
     df['TOTAL_PAX'] = df['PAX_LOCAL'] + df['PAX_CONEXAO_DOMESTICO'] + df['PAX_CONEXAO_INTERNACIONAL']
     df['OCCUPANCY_RATE'] = df.apply(
-        lambda row: (row['TOTAL_PAX'] / row['AIRCRAFT_CAPACITY'] * 100) 
-        if pd.notnull(row['AIRCRAFT_CAPACITY']) and row['AIRCRAFT_CAPACITY'] > 0 
-        else None, 
-        axis=1
+        lambda row: (row['TOTAL_PAX'] / row['AIRCRAFT_CAPACITY'] * 100)
+        if pd.notnull(row['AIRCRAFT_CAPACITY']) and row['AIRCRAFT_CAPACITY'] > 0
+        else None, axis=1
     )
     df['EXCEEDS_CAPACITY'] = False
     df.loc[df['AIRCRAFT_CAPACITY'].notna(), 'EXCEEDS_CAPACITY'] = \
         df.loc[df['AIRCRAFT_CAPACITY'].notna(), 'TOTAL_PAX'] > df.loc[df['AIRCRAFT_CAPACITY'].notna(), 'AIRCRAFT_CAPACITY']
     df['GERAL_PAX_VIOLATION'] = (df['AERONAVE_OPERADOR'] == 'GERAL') & (df['TOTAL_PAX'] > 0)
     df['RPE_BRANCO_VIOLATION'] = (
-        (df['AERONAVE_OPERADOR'] != 'GERAL') & 
-        (df['TOTAL_PAX'] == 0) & 
-        (~df['SERVICE_TYPE'].isin(['F','M','P','A','X','Y','Z']))
+        (df['AERONAVE_OPERADOR'] != 'GERAL') &
+        (df['TOTAL_PAX'] == 0) &
+        (~df['SERVICE_TYPE'].isin(['F', 'M', 'P', 'A', 'X', 'Y', 'Z']))
     )
     df['OPERATION_TYPE'] = df['AERONAVE_OPERADOR'].apply(
         lambda x: 'Aviação Geral' if x == 'GERAL' else 'Aviação Comercial'
@@ -165,7 +563,6 @@ def validate_passenger_count(df):
 
 
 def process_flight_data(df):
-    """Process flight data and create necessary groupings for visualization."""
     def convert_date(date_str):
         try:
             return pd.to_datetime(date_str, format='%d/%m/%Y')
@@ -185,162 +582,68 @@ def process_flight_data(df):
         st.warning("Atenção: Foram encontradas datas inválidas nos seguintes registros:")
         st.dataframe(invalid_dates[['CALCO_DATA', 'VOO_NUMERO', 'AERONAVE_MARCAS']])
     df = df.dropna(subset=['CALCO_DATA'])
-
     operations_by_date = df.groupby(['CALCO_DATA', 'OPERATION_TYPE']).size().reset_index(name='OPERATIONS_COUNT')
     passengers_by_date = df.groupby('CALCO_DATA')['TOTAL_PAX'].sum().reset_index()
     occupancy_by_aircraft = df[df['AIRCRAFT_CAPACITY'].notna()].groupby('AERONAVE_TIPO').agg({
-        'OCCUPANCY_RATE': 'mean',
-        'TOTAL_PAX': 'sum',
-        'AIRCRAFT_CAPACITY': 'first'
+        'OCCUPANCY_RATE': 'mean', 'TOTAL_PAX': 'sum', 'AIRCRAFT_CAPACITY': 'first'
     }).reset_index()
     occupancy_by_aircraft = occupancy_by_aircraft.sort_values('OCCUPANCY_RATE', ascending=True)
-
     return operations_by_date, passengers_by_date, occupancy_by_aircraft
 
 
 def create_ponte_chart(df, title_suffix=''):
-    """
-    Cria o gráfico de pizza para uso de ponte de embarque (Campo 18 - PONTE_CONECTOR_REMOTA).
-    Regras conforme Portaria nº 2.176/SRA/SIA:
-      1 = Ponte de Embarque
-      2 = Conector Remoto Acessível
-      3 = Modo Remoto
-      4 = Sem Passageiros pelo Terminal
-    """
-    # Converte a coluna para numérico, forçando erros para NaN
     df = df.copy()
     df['PONTE_CONECTOR_REMOTA'] = pd.to_numeric(df['PONTE_CONECTOR_REMOTA'], errors='coerce')
-
-    # Mapeia os valores para os rótulos da portaria
     df['PONTE_LABEL'] = df['PONTE_CONECTOR_REMOTA'].map(PONTE_LABELS)
-
-    # Conta os valores válidos
     ponte_counts = df['PONTE_LABEL'].value_counts().reset_index()
     ponte_counts.columns = ['Modalidade', 'Quantidade']
-
-    # Identifica inválidos/ausentes
     invalid_count = df['PONTE_LABEL'].isna().sum()
-
     chart_title = 'Uso de Ponte de Embarque (Campo 18 – PONTE_CONECTOR_REMOTO)'
     if title_suffix:
         chart_title += f' – {title_suffix}'
-
-    # Cria o gráfico de pizza
-    fig = px.pie(
-        ponte_counts,
-        values='Quantidade',
-        names='Modalidade',
-        title=chart_title,
-        color='Modalidade',
-        color_discrete_map=PONTE_COLORS,
-        hole=0.35  # Donut sutil para modernidade
-    )
-
-    fig.update_traces(
-        textposition='inside',
-        textinfo='percent+label',
-        hovertemplate='<b>%{label}</b><br>Operações: %{value}<br>Percentual: %{percent}<extra></extra>'
-    )
-
-    fig.update_layout(
-        plot_bgcolor='rgba(0,0,0,0)',
-        paper_bgcolor='rgba(0,0,0,0)',
-        font=dict(color='#2C3E50'),
-        title_font_color='#2C3E50',
-        legend=dict(
-            orientation='v',
-            yanchor='middle',
-            y=0.5,
-            xanchor='left',
-            x=1.05
-        )
-    )
-
+    fig = px.pie(ponte_counts, values='Quantidade', names='Modalidade', title=chart_title,
+                 color='Modalidade', color_discrete_map=PONTE_COLORS, hole=0.35)
+    fig.update_traces(textposition='inside', textinfo='percent+label',
+                      hovertemplate='<b>%{label}</b><br>Operações: %{value}<br>Percentual: %{percent}<extra></extra>')
+    fig.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
+                      font=dict(color='#2C3E50'), title_font_color='#2C3E50',
+                      legend=dict(orientation='v', yanchor='middle', y=0.5, xanchor='left', x=1.05))
     return fig, df, invalid_count, ponte_counts
 
 
 def create_ponte_by_type_chart(df):
-    """
-    Cria gráfico de barras agrupadas mostrando o uso de Ponte de Embarque
-    separado por Aviação Geral e Aviação Comercial.
-    """
     df = df.copy()
     df['PONTE_CONECTOR_REMOTA'] = pd.to_numeric(df['PONTE_CONECTOR_REMOTA'], errors='coerce')
     df['PONTE_LABEL'] = df['PONTE_CONECTOR_REMOTA'].map(PONTE_LABELS)
-
-    # Agrupa por tipo de operação e modalidade
-    grouped = (
-        df[df['PONTE_LABEL'].notna()]
-        .groupby(['OPERATION_TYPE', 'PONTE_LABEL'])
-        .size()
-        .reset_index(name='Quantidade')
-    )
+    grouped = (df[df['PONTE_LABEL'].notna()].groupby(['OPERATION_TYPE', 'PONTE_LABEL'])
+               .size().reset_index(name='Quantidade'))
     grouped.columns = ['Tipo de Operação', 'Modalidade', 'Quantidade']
-
-    # Calcula percentual dentro de cada tipo
     totals = grouped.groupby('Tipo de Operação')['Quantidade'].transform('sum')
     grouped['Percentual (%)'] = (grouped['Quantidade'] / totals * 100).round(1)
-
-    fig = px.bar(
-        grouped,
-        x='Modalidade',
-        y='Quantidade',
-        color='Tipo de Operação',
-        barmode='group',
-        title='Uso de Ponte de Embarque por Tipo de Operação',
-        template='plotly_white',
-        text=grouped['Quantidade'].astype(str) + '<br>(' + grouped['Percentual (%)'].astype(str) + '%)',
-        color_discrete_map={
-            'Aviação Comercial': '#2E86C1',
-            'Aviação Geral': '#E67E22'
-        }
-    )
-
+    fig = px.bar(grouped, x='Modalidade', y='Quantidade', color='Tipo de Operação', barmode='group',
+                 title='Uso de Ponte de Embarque por Tipo de Operação', template='plotly_white',
+                 text=grouped['Quantidade'].astype(str) + '<br>(' + grouped['Percentual (%)'].astype(str) + '%)',
+                 color_discrete_map={'Aviação Comercial': '#2E86C1', 'Aviação Geral': '#E67E22'})
     fig.update_traces(textposition='outside')
-    fig.update_layout(
-        plot_bgcolor='rgba(0,0,0,0)',
-        paper_bgcolor='rgba(0,0,0,0)',
-        font=dict(color='#2C3E50'),
-        title_font_color='#2C3E50',
-        xaxis_title='Modalidade',
-        yaxis_title='Número de Operações',
-        legend_title='Tipo de Operação',
-    )
-
+    fig.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
+                      font=dict(color='#2C3E50'), title_font_color='#2C3E50',
+                      xaxis_title='Modalidade', yaxis_title='Número de Operações', legend_title='Tipo de Operação')
     return fig
 
 
 def create_operations_chart(operations_by_date):
-    """Create the operations chart with separated operation types."""
-    fig = px.bar(
-        operations_by_date,
-        x='CALCO_DATA',
-        y='OPERATIONS_COUNT',
-        color='OPERATION_TYPE',
-        title='Operações Diárias por Tipo',
-        template="plotly_white",
-        barmode='stack',
-        text='OPERATIONS_COUNT',
-        color_discrete_map={
-            'Aviação Comercial': '#2E86C1',
-            'Aviação Geral': '#E67E22'
-        }
-    )
-    fig.update_layout(
-        plot_bgcolor='rgba(0,0,0,0)',
-        paper_bgcolor='rgba(0,0,0,0)',
-        font=dict(color='#2C3E50'),
-        title_font_color='#2C3E50',
-        legend_title_text='Tipo de Operação',
-        xaxis_title="Data",
-        yaxis_title="Número de Operações"
-    )
+    fig = px.bar(operations_by_date, x='CALCO_DATA', y='OPERATIONS_COUNT', color='OPERATION_TYPE',
+                 title='Operações Diárias por Tipo', template="plotly_white", barmode='stack',
+                 text='OPERATIONS_COUNT',
+                 color_discrete_map={'Aviação Comercial': '#2E86C1', 'Aviação Geral': '#E67E22'})
+    fig.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
+                      font=dict(color='#2C3E50'), title_font_color='#2C3E50',
+                      legend_title_text='Tipo de Operação', xaxis_title="Data", yaxis_title="Número de Operações")
     fig.update_traces(textposition='inside', texttemplate='%{text:,.0f}')
     return fig
 
 
 def validate_movement_times(df):
-    """Validate movement times based on MOVIMENTO_TIPO."""
     df = df.copy()
 
     def parse_datetime(date_str, time_str):
@@ -357,18 +660,14 @@ def validate_movement_times(df):
                         return None
             else:
                 date_obj = date_str
-            try:
-                time_parts = time_str.split(':')
-                hour = int(time_parts[0])
-                minute = int(time_parts[1])
-                second = int(time_parts[2]) if len(time_parts) > 2 else 0
-                full_datetime = pd.Timestamp.combine(
-                    date_obj.date(),
-                    pd.Timestamp.min.time().replace(hour=hour, minute=minute, second=second)
-                )
-                return full_datetime
-            except:
-                return None
+            time_parts = time_str.split(':')
+            hour = int(time_parts[0])
+            minute = int(time_parts[1])
+            second = int(time_parts[2]) if len(time_parts) > 2 else 0
+            return pd.Timestamp.combine(
+                date_obj.date(),
+                pd.Timestamp.min.time().replace(hour=hour, minute=minute, second=second)
+            )
         except Exception:
             return None
 
@@ -376,79 +675,59 @@ def validate_movement_times(df):
     df['TOQUE_DATETIME'] = df.apply(lambda row: parse_datetime(row['TOQUE_DATA'], row['TOQUE_HORARIO']), axis=1)
     df['HORARIO_INVALIDO'] = False
     df['ERRO_VALIDACAO'] = ''
-
     landing_mask = (df['MOVIMENTO_TIPO'] == 'P') & df['CALCO_DATETIME'].notna() & df['TOQUE_DATETIME'].notna()
     df.loc[landing_mask, 'HORARIO_INVALIDO'] = df.loc[landing_mask, 'CALCO_DATETIME'] < df.loc[landing_mask, 'TOQUE_DATETIME']
     df.loc[landing_mask & df['HORARIO_INVALIDO'], 'ERRO_VALIDACAO'] = 'Calço anterior ao Toque em Pouso'
-
     takeoff_mask = (df['MOVIMENTO_TIPO'] == 'D') & df['CALCO_DATETIME'].notna() & df['TOQUE_DATETIME'].notna()
     df.loc[takeoff_mask, 'HORARIO_INVALIDO'] = df.loc[takeoff_mask, 'CALCO_DATETIME'] > df.loc[takeoff_mask, 'TOQUE_DATETIME']
     df.loc[takeoff_mask & df['HORARIO_INVALIDO'], 'ERRO_VALIDACAO'] = 'Calço posterior ao Toque em Decolagem'
-
     missing_times = (
         (df['CALCO_DATETIME'].isna() | df['TOQUE_DATETIME'].isna()) &
         df['MOVIMENTO_TIPO'].isin(['P', 'D'])
     )
     df.loc[missing_times, 'HORARIO_INVALIDO'] = True
     df.loc[missing_times, 'ERRO_VALIDACAO'] = 'Horários incompletos'
-
     return df
 
 
 def create_cargo_chart(df):
-    """Create the daily cargo chart."""
     cargo_by_date = df.groupby('CALCO_DATA').agg({'CARGA': 'sum', 'CORREIO': 'sum'}).reset_index()
     cargo_melted = pd.melt(cargo_by_date, id_vars=['CALCO_DATA'], value_vars=['CARGA', 'CORREIO'],
                            var_name='Tipo', value_name='Peso')
-    fig = px.bar(
-        cargo_melted, x='CALCO_DATA', y='Peso', color='Tipo',
-        title='Total Diário de Carga e Correio', template="plotly_white",
-        barmode='stack', text='Peso',
-        color_discrete_map={'CARGA': '#712ECC', 'CORREIO': '#2E89CC'}
-    )
-    fig.update_layout(
-        plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
-        font=dict(color='#2C3E50'), title_font_color='#2C3E50',
-        xaxis_title="Data", yaxis_title="Peso (kg)", legend_title="Tipo"
-    )
+    fig = px.bar(cargo_melted, x='CALCO_DATA', y='Peso', color='Tipo',
+                 title='Total Diário de Carga e Correio', template="plotly_white",
+                 barmode='stack', text='Peso',
+                 color_discrete_map={'CARGA': '#712ECC', 'CORREIO': '#2E89CC'})
+    fig.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
+                      font=dict(color='#2C3E50'), title_font_color='#2C3E50',
+                      xaxis_title="Data", yaxis_title="Peso (kg)", legend_title="Tipo")
     fig.update_traces(textposition='inside', texttemplate='%{text:,.0f}')
     return fig
 
 
 def create_passengers_chart(passengers_by_date):
-    """Create the passengers chart."""
-    fig = px.bar(
-        passengers_by_date, x='CALCO_DATA', y='TOTAL_PAX',
-        title='Total Diário de Passageiros', template="plotly_white", text='TOTAL_PAX'
-    )
+    fig = px.bar(passengers_by_date, x='CALCO_DATA', y='TOTAL_PAX',
+                 title='Total Diário de Passageiros', template="plotly_white", text='TOTAL_PAX')
     fig.update_traces(marker_color='#27AE60', textposition='inside', texttemplate='%{text:,.0f}')
-    fig.update_layout(
-        plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
-        font=dict(color='#2C3E50'), title_font_color='#2C3E50',
-        xaxis_title="Data", yaxis_title="Total de Passageiros"
-    )
+    fig.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
+                      font=dict(color='#2C3E50'), title_font_color='#2C3E50',
+                      xaxis_title="Data", yaxis_title="Total de Passageiros")
     return fig
 
 
 def create_occupancy_chart(occupancy_by_aircraft):
-    """Create the occupancy rate chart."""
-    fig = px.bar(
-        occupancy_by_aircraft, x='AERONAVE_TIPO', y='OCCUPANCY_RATE',
-        title='Taxa Média de Ocupação por Tipo de Aeronave', template="plotly_white",
-        text=occupancy_by_aircraft['OCCUPANCY_RATE'].round(1).astype(str) + '%'
-    )
+    fig = px.bar(occupancy_by_aircraft, x='AERONAVE_TIPO', y='OCCUPANCY_RATE',
+                 title='Taxa Média de Ocupação por Tipo de Aeronave', template="plotly_white",
+                 text=occupancy_by_aircraft['OCCUPANCY_RATE'].round(1).astype(str) + '%')
     fig.update_traces(marker_color='#8E44AD', textposition='outside')
-    fig.update_layout(
-        plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
-        font=dict(color='#2C3E50'), title_font_color='#2C3E50',
-        xaxis_title="Tipo de Aeronave", yaxis_title="Taxa Média de Ocupação (%)",
-        yaxis_range=[0, max(100, occupancy_by_aircraft['OCCUPANCY_RATE'].max() + 5)]
-    )
+    fig.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
+                      font=dict(color='#2C3E50'), title_font_color='#2C3E50',
+                      xaxis_title="Tipo de Aeronave", yaxis_title="Taxa Média de Ocupação (%)",
+                      yaxis_range=[0, max(100, occupancy_by_aircraft['OCCUPANCY_RATE'].max() + 5)])
     return fig
 
 
 def create_geral_validation_chart(df):
-    """Create the GERAL validation chart and get invalid flights."""
     geral_flights = df[df['AERONAVE_OPERADOR'] == 'GERAL'].copy()
     geral_flights['VALIDATION_STATUS'] = geral_flights['TOTAL_PAX'].apply(
         lambda x: 'Inválido (PAX > 0)' if x > 0 else 'Válido (PAX = 0)'
@@ -456,17 +735,17 @@ def create_geral_validation_chart(df):
     validation_counts = geral_flights['VALIDATION_STATUS'].value_counts().reset_index()
     validation_counts.columns = ['Status', 'Count']
     colors = {'Válido (PAX = 0)': '#27AE60', 'Inválido (PAX > 0)': '#E74C3C'}
-    fig = px.pie(
-        validation_counts, values='Count', names='Status',
-        title='Validação de Passageiros em Voos da Aviação Geral',
-        color='Status', color_discrete_map=colors
-    )
-    fig.update_layout(
-        plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
-        font=dict(color='#2C3E50'), title_font_color='#2C3E50'
-    )
+    fig = px.pie(validation_counts, values='Count', names='Status',
+                 title='Validação de Passageiros em Voos da Aviação Geral',
+                 color='Status', color_discrete_map=colors)
+    fig.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
+                      font=dict(color='#2C3E50'), title_font_color='#2C3E50')
     return fig, geral_flights[geral_flights['TOTAL_PAX'] > 0]
 
+
+# ─────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────
 
 def main():
     st.title('Análise de Operações e Passageiros')
@@ -479,27 +758,24 @@ def main():
         df = validate_movement_times(df)
         operations_by_date, passengers_by_date, occupancy_by_aircraft = process_flight_data(df)
         geral_validation_fig, invalid_geral_flights = create_geral_validation_chart(df)
-
-        # ── Ponte de Embarque – pré-processa PONTE_LABEL no df principal ──────
         _, df_with_ponte, _, _ = create_ponte_chart(df)
         df['PONTE_LABEL'] = df_with_ponte['PONTE_LABEL']
 
-        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
             "Operações & Passageiros",
             "Análise de Ocupação",
             "Validação Aviação Geral",
             "Detalhes das Violações",
             "Uso de Ponte de Embarque",
+            "✅ Validação de Campos",          # ← nova aba
         ])
 
         with tab1:
             col1, col2 = st.columns(2)
             with col1:
-                total_commercial = len(df[df['OPERATION_TYPE'] == 'Aviação Comercial'])
-                st.metric("Total Operações Comerciais", total_commercial)
+                st.metric("Total Operações Comerciais", len(df[df['OPERATION_TYPE'] == 'Aviação Comercial']))
             with col2:
-                total_general = len(df[df['OPERATION_TYPE'] == 'Aviação Geral'])
-                st.metric("Total Operações Aviação Geral", total_general)
+                st.metric("Total Operações Aviação Geral", len(df[df['OPERATION_TYPE'] == 'Aviação Geral']))
             st.plotly_chart(create_operations_chart(operations_by_date), use_container_width=True)
             st.plotly_chart(create_passengers_chart(passengers_by_date), use_container_width=True)
             st.plotly_chart(create_cargo_chart(df), use_container_width=True)
@@ -523,13 +799,11 @@ def main():
                     invalid_geral_flights[[
                         'CALCO_DATA', 'VOO_NUMERO', 'AERONAVE_TIPO',
                         'TOTAL_PAX', 'PAX_LOCAL', 'PAX_CONEXAO_DOMESTICO', 'PAX_CONEXAO_INTERNACIONAL'
-                    ]].sort_values('TOTAL_PAX', ascending=False),
-                    hide_index=True
+                    ]].sort_values('TOTAL_PAX', ascending=False), hide_index=True
                 )
 
         with tab4:
             st.subheader('Detalhes das Violações')
-
             st.write("### Violações de Capacidade da Aeronave")
             capacity_violations = df[df['EXCEEDS_CAPACITY']].copy()
             if not capacity_violations.empty:
@@ -540,86 +814,62 @@ def main():
                         'CALCO_DATA', 'VOO_NUMERO', 'AERONAVE_OPERADOR', 'AERONAVE_MARCAS', 'AERONAVE_TIPO',
                         'AIRCRAFT_CAPACITY', 'TOTAL_PAX', 'EXCESSO_PAX',
                         'PAX_LOCAL', 'PAX_CONEXAO_DOMESTICO', 'PAX_CONEXAO_INTERNACIONAL'
-                    ]].sort_values(['EXCESSO_PAX', 'CALCO_DATA'], ascending=[False, True]),
-                    hide_index=True
+                    ]].sort_values(['EXCESSO_PAX', 'CALCO_DATA'], ascending=[False, True]), hide_index=True
                 )
             else:
                 st.info("Não foram encontradas violações de capacidade.")
-
             st.write("### Detalhes das Violações de Aviação Geral")
             geral_violations = df[df['GERAL_PAX_VIOLATION']].copy()
             if not geral_violations.empty:
-                st.write("#### Todos os Voos com Violações")
                 geral_violations['CALCO_DATA'] = geral_violations['CALCO_DATA'].dt.strftime('%d/%m/%Y')
                 st.dataframe(
                     geral_violations[[
                         'CALCO_DATA', 'VOO_NUMERO', 'AERONAVE_OPERADOR', 'AERONAVE_MARCAS', 'AERONAVE_TIPO',
                         'TOTAL_PAX', 'PAX_LOCAL', 'PAX_CONEXAO_DOMESTICO', 'PAX_CONEXAO_INTERNACIONAL'
-                    ]].sort_values(['TOTAL_PAX', 'CALCO_DATA'], ascending=[False, True]),
-                    hide_index=True
+                    ]].sort_values(['TOTAL_PAX', 'CALCO_DATA'], ascending=[False, True]), hide_index=True
                 )
-                st.write("#### Resumo Diário das Violações")
                 daily_violations = geral_violations.groupby('CALCO_DATA').agg({
-                    'VOO_NUMERO': 'count',
-                    'TOTAL_PAX': 'sum',
+                    'VOO_NUMERO': 'count', 'TOTAL_PAX': 'sum',
                     'AERONAVE_MARCAS': lambda x: ', '.join(sorted(set(x)))
                 }).reset_index()
                 daily_violations.columns = ['Data', 'Número de Voos', 'Total de Passageiros', 'Marcas das Aeronaves']
-                st.dataframe(
-                    daily_violations.sort_values(['Total de Passageiros', 'Data'], ascending=[False, True]),
-                    hide_index=True
-                )
+                st.dataframe(daily_violations.sort_values(['Total de Passageiros', 'Data'], ascending=[False, True]),
+                             hide_index=True)
             else:
                 st.info("Não foram encontradas violações de aviação geral.")
-
             st.write("### Detalhes de RPE em Branco")
             rpe_branco_violations = df[df['RPE_BRANCO_VIOLATION']].copy()
             if not rpe_branco_violations.empty:
-                st.write("#### Voos Comerciais sem Passageiros (Excluindo Carga, Pouso Técnico)")
                 rpe_branco_violations['CALCO_DATA'] = rpe_branco_violations['CALCO_DATA'].dt.strftime('%d/%m/%Y')
                 st.dataframe(
                     rpe_branco_violations[[
                         'CALCO_DATA', 'VOO_NUMERO', 'AERONAVE_OPERADOR', 'AERONAVE_MARCAS', 'AERONAVE_TIPO',
                         'SERVICE_TYPE', 'TOTAL_PAX', 'PAX_LOCAL', 'PAX_CONEXAO_DOMESTICO', 'PAX_CONEXAO_INTERNACIONAL'
-                    ]].sort_values('CALCO_DATA', ascending=True),
-                    hide_index=True
+                    ]].sort_values('CALCO_DATA', ascending=True), hide_index=True
                 )
-                st.write("#### Resumo por Operador")
                 operator_summary = rpe_branco_violations.groupby(['AERONAVE_OPERADOR', 'SERVICE_TYPE']).agg({
-                    'VOO_NUMERO': 'count',
-                    'AERONAVE_MARCAS': lambda x: ', '.join(sorted(set(x)))
+                    'VOO_NUMERO': 'count', 'AERONAVE_MARCAS': lambda x: ', '.join(sorted(set(x)))
                 }).reset_index()
                 operator_summary.columns = ['Operador', 'Tipo de Serviço', 'Número de Voos', 'Marcas das Aeronaves']
-                st.dataframe(
-                    operator_summary.sort_values(['Operador', 'Número de Voos'], ascending=[True, False]),
-                    hide_index=True
-                )
+                st.dataframe(operator_summary.sort_values(['Operador', 'Número de Voos'], ascending=[True, False]),
+                             hide_index=True)
                 total_commercial = len(df[df['AERONAVE_OPERADOR'] != 'GERAL'])
                 violation_percentage = (len(rpe_branco_violations) / total_commercial * 100) if total_commercial > 0 else 0
-                st.metric("Percentual de Voos Comerciais com RPE em Branco", f"{violation_percentage:.2f}%",
-                          delta_color="inverse")
+                st.metric("Percentual de Voos Comerciais com RPE em Branco",
+                          f"{violation_percentage:.2f}%", delta_color="inverse")
             else:
                 st.info("Não foram encontradas violações de RPE em branco.")
 
-        # ── Aba 5: Uso de Ponte de Embarque ─────────────────────────────────
         with tab5:
             st.subheader('Uso de Ponte de Embarque (Campo 18 – PONTE_CONECTOR_REMOTO)')
             st.caption(
                 "Conforme Portaria nº 2.176/SRA/SIA, de 17.07.2019: "
-                "**1** = Ponte de Embarque | "
-                "**2** = Conector Remoto Acessível | "
-                "**3** = Modo Remoto | "
-                "**4** = Sem Passageiros pelo Terminal"
+                "**1** = Ponte de Embarque | **2** = Conector Remoto Acessível | "
+                "**3** = Modo Remoto | **4** = Sem Passageiros pelo Terminal"
             )
-
-            # Filtro por tipo de operação
-            filtro_tipo = st.radio(
-                "Filtrar por tipo de operação:",
-                ["Todas as Operações", "Aviação Comercial", "Aviação Geral"],
-                horizontal=True,
-                key="ponte_filtro"
-            )
-
+            filtro_tipo = st.radio("Filtrar por tipo de operação:",
+                                   ["Todas as Operações", "Aviação Comercial", "Aviação Geral"],
+                                   horizontal=True, key="ponte_filtro")
             if filtro_tipo == "Aviação Geral":
                 df_ponte = df[df['OPERATION_TYPE'] == 'Aviação Geral'].copy()
                 title_suffix = 'Aviação Geral'
@@ -629,44 +879,28 @@ def main():
             else:
                 df_ponte = df.copy()
                 title_suffix = ''
-
-            # Recalcula gráfico e contagens para o filtro selecionado
             ponte_fig_filtrado, df_ponte_filtrado, invalid_ponte_count_filtrado, ponte_counts_filtrado = \
                 create_ponte_chart(df_ponte, title_suffix=title_suffix)
-
-            # Métricas de distribuição
             total_ops = len(df_ponte)
             col1, col2, col3, col4 = st.columns(4)
-            for col, (label, color) in zip(
+            for col, (label, _) in zip(
                 [col1, col2, col3, col4],
-                [
-                    ('Ponte de Embarque', '#2E86C1'),
-                    ('Conector Remoto Acessível', '#27AE60'),
-                    ('Modo Remoto', '#E67E22'),
-                    ('Sem Passageiros pelo Terminal', '#95A5A6'),
-                ]
+                [('Ponte de Embarque', ''), ('Conector Remoto Acessível', ''),
+                 ('Modo Remoto', ''), ('Sem Passageiros pelo Terminal', '')]
             ):
                 count = ponte_counts_filtrado.loc[ponte_counts_filtrado['Modalidade'] == label, 'Quantidade'].values
                 count_val = int(count[0]) if len(count) > 0 else 0
                 pct = count_val / total_ops * 100 if total_ops > 0 else 0
                 with col:
                     st.metric(label, f"{count_val}", f"{pct:.1f}% das operações")
-
-            # Gráfico de pizza (filtrado)
             st.plotly_chart(ponte_fig_filtrado, use_container_width=True)
-
-            # Gráfico comparativo Aviação Geral x Aviação Comercial
             st.write("#### Comparativo: Aviação Geral vs. Aviação Comercial")
             st.plotly_chart(create_ponte_by_type_chart(df), use_container_width=True)
-
-            # Tabela detalhada de distribuição
             st.write("#### Distribuição por Modalidade")
             ponte_detail = ponte_counts_filtrado.copy()
             ponte_detail['Percentual (%)'] = (ponte_detail['Quantidade'] / total_ops * 100).round(2)
             ponte_detail = ponte_detail.sort_values('Quantidade', ascending=False).reset_index(drop=True)
             st.dataframe(ponte_detail, hide_index=True, use_container_width=True)
-
-            # Alerta de valores inválidos
             if invalid_ponte_count_filtrado > 0:
                 st.warning(
                     f"⚠️ Foram encontrados **{invalid_ponte_count_filtrado}** registros com valor inválido ou ausente "
@@ -676,14 +910,17 @@ def main():
                 if 'CALCO_DATA' in invalid_rows.columns:
                     invalid_rows['CALCO_DATA'] = invalid_rows['CALCO_DATA'].dt.strftime('%d/%m/%Y')
                 st.write("#### Registros com Valor Inválido/Ausente")
-                cols_to_show = ['CALCO_DATA', 'VOO_NUMERO', 'AERONAVE_OPERADOR',
-                                'AERONAVE_TIPO', 'PONTE_CONECTOR_REMOTA']
+                cols_to_show = ['CALCO_DATA', 'VOO_NUMERO', 'AERONAVE_OPERADOR', 'AERONAVE_TIPO', 'PONTE_CONECTOR_REMOTA']
                 cols_available = [c for c in cols_to_show if c in invalid_rows.columns]
                 st.dataframe(invalid_rows[cols_available].sort_values('CALCO_DATA'), hide_index=True)
             else:
                 st.success("✅ Todos os registros possuem valor válido no campo PONTE_CONECTOR_REMOTA.")
 
-        # ── Estatísticas Gerais ──────────────────────────────────────────────
+        # ── Nova aba 6 ─────────────────────────────────────────────────────
+        with tab6:
+            render_tab_campos(df)
+
+        # ── Estatísticas Gerais ────────────────────────────────────────────
         st.subheader('Estatísticas Gerais')
         col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
@@ -707,11 +944,7 @@ def main():
 
 
 if __name__ == "__main__":
-    st.set_page_config(
-        page_title="Análise de Voos",
-        page_icon="✈️",
-        layout="wide"
-    )
+    st.set_page_config(page_title="Análise de Voos", page_icon="✈️", layout="wide")
     st.markdown("""
         <style>
         .stApp { background-color: #F5F7FA; }
