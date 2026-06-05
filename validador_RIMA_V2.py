@@ -81,7 +81,7 @@ VALORES_VALIDOS = {
 # Regex de formato
 RE_DATA = re.compile(r'^\d{2}/\d{2}/\d{4}$')
 RE_HORARIO = re.compile(r'^\d{2}:\d{2}$')
-RE_OACI_ICAO = re.compile(r'^[A-Z]{4}$')         # aeroporto OACI
+RE_OACI_ICAO = re.compile(r'^[A-Z0-9]{4}$')      # aeroporto: 4 caracteres alfanuméricos
 RE_OACI_OPERADOR = re.compile(r'^[A-Z0-9]{2,3}$')  # designador de operador
 
 
@@ -161,7 +161,7 @@ def validate_fields(df: pd.DataFrame) -> pd.DataFrame:
                 add_error(idx, 'VOO_OUTRO_AEROPORTO',
                           CAMPOS_OBRIGATORIOS.get('VOO_OUTRO_AEROPORTO', 'Aeroporto Ant/Post'),
                           val, 'FORMATO INVÁLIDO',
-                          f"Código OACI deve ter 4 letras maiúsculas. Encontrado: '{val}'.")
+                          f"Código de aeroporto deve ter 4 caracteres alfanuméricos. Encontrado: '{val}'.")
 
         # ── 4. Campo 7 – VOO_NUMERO: numérico ───────────────────────────────
         val = row.get('VOO_NUMERO')
@@ -269,25 +269,12 @@ def validate_fields(df: pd.DataFrame) -> pd.DataFrame:
                       val, 'VALOR INVÁLIDO',
                       f"Esperado 'NE', 'NC', 'CO', 'DV' ou vazio. Encontrado: '{val}'.")
 
-        # ── 15. Consistência SERVICE_TYPE x RETORNO_ALTERNADO ────────────────
-        st_val = str(row.get('SERVICE_TYPE', '') or '').strip().upper()
-        ra_val = str(row.get('RETORNO_ALTERNADO', '') or '').strip().upper()
-        if st_val == 'Y' and ra_val not in ('A', ''):
-            add_error(idx, 'RETORNO_ALTERNADO',
-                      CAMPOS_OPCIONAIS.get('RETORNO_ALTERNADO', 'Retorno/Alternado'),
-                      ra_val, 'INCONSISTÊNCIA',
-                      "SERVICE_TYPE='Y' (alternado) mas RETORNO_ALTERNADO não é 'A'.")
-        if st_val == 'Z' and ra_val not in ('R', ''):
-            add_error(idx, 'RETORNO_ALTERNADO',
-                      CAMPOS_OPCIONAIS.get('RETORNO_ALTERNADO', 'Retorno/Alternado'),
-                      ra_val, 'INCONSISTÊNCIA',
-                      "SERVICE_TYPE='Z' (retorno) mas RETORNO_ALTERNADO não é 'R'.")
-
-        # ── 16. Consistência NATUREZA x AERONAVE_MARCAS ──────────────────────
-        # Matrícula brasileira começa com PS-, PP-, PR-, PT-, PU-
+        # ── 15. Consistência NATUREZA x AERONAVE_MARCAS ──────────────────────
+        # Matrícula brasileira começa com PS-, PP-, PR-, PT-, PU-.
+        # Aeronaves da Força Aérea Brasileira (prefixo FAB) também são domésticas.
         marcas = str(row.get('AERONAVE_MARCAS', '') or '').strip().upper()
         natureza = str(row.get('NATUREZA', '') or '').strip().upper()
-        br_prefix = marcas[:2] in ('PS', 'PP', 'PR', 'PT', 'PU')
+        br_prefix = marcas[:2] in ('PS', 'PP', 'PR', 'PT', 'PU') or marcas.startswith('FAB')
         if natureza == 'D' and marcas and not br_prefix:
             add_error(idx, 'NATUREZA', CAMPOS_OBRIGATORIOS.get('NATUREZA', 'Natureza'),
                       natureza, 'INCONSISTÊNCIA',
@@ -805,7 +792,7 @@ def build_fechamento_comparison(resumo_a: dict, resumo_b: dict,
             nome_b: vb,
             'Diferença (B−A)': diff,
             'Diferença (%)': round(pct, 2),
-            'Status': '✅ Igual' if diff == 0 else '⚠️ Divergente',
+            'Status': 'Igual' if diff == 0 else 'Com diferença',
         })
     return pd.DataFrame(linhas)
 
@@ -840,18 +827,21 @@ def render_tab_fechamento(df_a: pd.DataFrame):
     resumo_b = compute_fechamento_summary(df_b)
     comp = build_fechamento_comparison(resumo_a, resumo_b, nome_a, nome_b)
 
-    # ── Indicadores de topo ────────────────────────────────────────────────
-    divergentes = int((comp['Status'] == '⚠️ Divergente').sum())
+    # ── Indicadores de topo (apenas informativos — diferenças são normais) ──
+    com_diferenca = int((comp['Status'] == 'Com diferença').sum())
     total_metricas = len(comp)
     col1, col2, col3 = st.columns(3)
     col1.metric('Métricas Comparadas', total_metricas)
-    col2.metric('Métricas Conciliadas', total_metricas - divergentes)
-    col3.metric('Divergências', divergentes, delta_color='inverse')
+    col2.metric('Métricas Iguais', total_metricas - com_diferenca)
+    col3.metric('Métricas com Diferença', com_diferenca, delta_color='off')
 
-    if divergentes == 0:
-        st.success('✅ Os dois RIMAs estão totalmente conciliados em todas as métricas.')
+    if com_diferenca == 0:
+        st.info('Os dois RIMAs apresentam os mesmos totais em todas as métricas.')
     else:
-        st.warning(f'⚠️ Foram encontradas {divergentes} divergência(s) entre os arquivos.')
+        st.info(
+            f'{com_diferenca} métrica(s) apresentam diferença entre os arquivos. '
+            'Variações de fechamento são esperadas — abaixo estão apenas destacadas para conferência.'
+        )
 
     st.markdown('---')
 
@@ -865,8 +855,8 @@ def render_tab_fechamento(df_a: pd.DataFrame):
         vb = resumo_b[met]
         delta = vb - va
         col.metric(met, f'{vb:,.0f}'.replace(',', '.'),
-                   f'{delta:+,.0f}'.replace(',', '.'),
-                   delta_color='off' if delta == 0 else 'normal')
+                   f'{delta:+,.0f}'.replace(',', '.') if delta != 0 else None,
+                   delta_color='off')
 
     st.markdown('---')
 
@@ -891,7 +881,8 @@ def render_tab_fechamento(df_a: pd.DataFrame):
     st.write('#### Tabela Comparativa Detalhada')
 
     def _highlight(row):
-        cor = 'background-color: #FDEDEC' if row['Status'] == '⚠️ Divergente' else ''
+        # Destaque neutro (azul claro) — diferença não é erro
+        cor = 'background-color: #EBF5FB' if row['Status'] == 'Com diferença' else ''
         return [cor] * len(row)
 
     styled = comp.style.apply(_highlight, axis=1).format({
@@ -1130,3 +1121,4 @@ if __name__ == "__main__":
         </style>
     """, unsafe_allow_html=True)
     main()
+Eu
