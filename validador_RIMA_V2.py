@@ -367,17 +367,8 @@ def render_tab_campos(df: pd.DataFrame):
         xaxis_title='Campo', yaxis_title='Quantidade de Erros',
         legend_title='Tipo de Erro'
     )
-    st.plotly_chart(fig_campos, use_container_width=True)
 
     # ── Gráfico: distribuição por tipo de erro ─────────────────────────────
-    fig_tipo = px.pie(
-        tipo_counts.reset_index().rename(columns={'index': 'Tipo', 'TIPO_ERRO': 'Tipo', 'count': 'Quantidade'}),
-        names='TIPO_ERRO', values='count' if 'count' in tipo_counts.reset_index().columns else 'TIPO_ERRO',
-        title='Distribuição por Tipo de Erro',
-        color_discrete_sequence=['#E74C3C', '#E67E22', '#F39C12', '#8E44AD', '#3498DB'],
-        hole=0.4
-    )
-    # Garante compatibilidade com versões do plotly
     tc = tipo_counts.reset_index()
     tc.columns = ['Tipo', 'Quantidade']
     fig_tipo = px.pie(
