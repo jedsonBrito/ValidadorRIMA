@@ -735,6 +735,182 @@ def create_geral_validation_chart(df):
 
 
 # ─────────────────────────────────────────────────────────────
+# LEITURA PADRONIZADA DO RIMA
+# ─────────────────────────────────────────────────────────────
+
+def read_rima_csv(file):
+    """
+    Lê um CSV de RIMA preservando textos como 'N/A', 'NA', 'NULL' (que o
+    pandas, por padrão, converteria em NaN). Apenas células realmente vazias
+    tornam-se NaN.
+    """
+    return pd.read_csv(
+        file, sep=';', encoding='utf-8',
+        keep_default_na=False, na_values=['']
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# FECHAMENTO / CONCILIAÇÃO ENTRE DOIS RIMAS
+# ─────────────────────────────────────────────────────────────
+
+def compute_fechamento_summary(df: pd.DataFrame) -> dict:
+    """
+    Calcula os totais consolidados de um RIMA para fins de fechamento:
+    ATM (movimentos), passageiros, conexões, carga e correio.
+    """
+    d = df.copy()
+
+    # Garante numéricos (campos podem vir como string dependendo da origem)
+    for c in ['PAX_LOCAL', 'PAX_CONEXAO_DOMESTICO', 'PAX_CONEXAO_INTERNACIONAL',
+              'CORREIO', 'CARGA']:
+        if c in d.columns:
+            d[c] = pd.to_numeric(d[c], errors='coerce').fillna(0)
+        else:
+            d[c] = 0
+
+    mov = d['MOVIMENTO_TIPO'].astype(str).str.strip().str.upper() \
+        if 'MOVIMENTO_TIPO' in d.columns else pd.Series([], dtype=str)
+
+    pax_local = d['PAX_LOCAL'].sum()
+    pax_dom = d['PAX_CONEXAO_DOMESTICO'].sum()
+    pax_int = d['PAX_CONEXAO_INTERNACIONAL'].sum()
+
+    return {
+        'ATM Total (movimentos)': int(len(d)),
+        'ATM Pousos (P)': int((mov == 'P').sum()),
+        'ATM Decolagens (D)': int((mov == 'D').sum()),
+        'PAX Total': int(pax_local + pax_dom + pax_int),
+        'PAX Local': int(pax_local),
+        'PAX Conexão Doméstico': int(pax_dom),
+        'PAX Conexão Internacional': int(pax_int),
+        'Conexões Total': int(pax_dom + pax_int),
+        'Carga (kg)': float(d['CARGA'].sum()),
+        'Correio (kg)': float(d['CORREIO'].sum()),
+    }
+
+
+def build_fechamento_comparison(resumo_a: dict, resumo_b: dict,
+                                nome_a: str, nome_b: str) -> pd.DataFrame:
+    """Monta o DataFrame comparativo entre os dois resumos."""
+    linhas = []
+    for metrica in resumo_a:
+        va = resumo_a[metrica]
+        vb = resumo_b.get(metrica, 0)
+        diff = vb - va
+        pct = (diff / va * 100) if va != 0 else (100.0 if diff != 0 else 0.0)
+        linhas.append({
+            'Métrica': metrica,
+            nome_a: va,
+            nome_b: vb,
+            'Diferença (B−A)': diff,
+            'Diferença (%)': round(pct, 2),
+            'Status': '✅ Igual' if diff == 0 else '⚠️ Divergente',
+        })
+    return pd.DataFrame(linhas)
+
+
+def render_tab_fechamento(df_a: pd.DataFrame):
+    """Renderiza a aba de Fechamento/Conciliação entre dois RIMAs."""
+    st.subheader('Fechamento / Conciliação — Comparação entre dois RIMAs')
+    st.caption(
+        "Compara os totais de ATM (movimentos), passageiros, conexões, carga e "
+        "correio entre o arquivo principal (A) e um segundo arquivo (B). "
+        "Útil para conciliar versões, períodos ou fontes diferentes do mesmo período."
+    )
+
+    arquivo_b = st.file_uploader(
+        "Arquivo B (RIMA para comparar)", type="csv", key="fechamento_uploader"
+    )
+
+    if arquivo_b is None:
+        st.info("⬆️ Envie um segundo arquivo RIMA para comparar com o arquivo principal.")
+        return
+
+    try:
+        df_b = read_rima_csv(arquivo_b)
+    except Exception as e:
+        st.error(f"Não foi possível ler o Arquivo B: {e}")
+        return
+
+    nome_a = "RIMA A (principal)"
+    nome_b = "RIMA B"
+
+    resumo_a = compute_fechamento_summary(df_a)
+    resumo_b = compute_fechamento_summary(df_b)
+    comp = build_fechamento_comparison(resumo_a, resumo_b, nome_a, nome_b)
+
+    # ── Indicadores de topo ────────────────────────────────────────────────
+    divergentes = int((comp['Status'] == '⚠️ Divergente').sum())
+    total_metricas = len(comp)
+    col1, col2, col3 = st.columns(3)
+    col1.metric('Métricas Comparadas', total_metricas)
+    col2.metric('Métricas Conciliadas', total_metricas - divergentes)
+    col3.metric('Divergências', divergentes, delta_color='inverse')
+
+    if divergentes == 0:
+        st.success('✅ Os dois RIMAs estão totalmente conciliados em todas as métricas.')
+    else:
+        st.warning(f'⚠️ Foram encontradas {divergentes} divergência(s) entre os arquivos.')
+
+    st.markdown('---')
+
+    # ── Métricas-chave lado a lado (com delta) ─────────────────────────────
+    st.write('#### Principais Totais')
+    destaques = ['ATM Total (movimentos)', 'PAX Total', 'Conexões Total',
+                 'Carga (kg)', 'Correio (kg)']
+    cols = st.columns(len(destaques))
+    for col, met in zip(cols, destaques):
+        va = resumo_a[met]
+        vb = resumo_b[met]
+        delta = vb - va
+        col.metric(met, f'{vb:,.0f}'.replace(',', '.'),
+                   f'{delta:+,.0f}'.replace(',', '.'),
+                   delta_color='off' if delta == 0 else 'normal')
+
+    st.markdown('---')
+
+    # ── Gráfico comparativo ────────────────────────────────────────────────
+    fig_df = comp.melt(
+        id_vars=['Métrica'], value_vars=[nome_a, nome_b],
+        var_name='Arquivo', value_name='Valor'
+    )
+    fig = px.bar(
+        fig_df, x='Métrica', y='Valor', color='Arquivo', barmode='group',
+        title='Comparação de Totais por Métrica', template='plotly_white',
+        color_discrete_map={nome_a: '#2E86C1', nome_b: '#E67E22'},
+    )
+    fig.update_layout(
+        plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
+        font=dict(color='#2C3E50'), xaxis_tickangle=-35,
+        xaxis_title='Métrica', yaxis_title='Valor', legend_title='Arquivo'
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── Tabela detalhada ───────────────────────────────────────────────────
+    st.write('#### Tabela Comparativa Detalhada')
+
+    def _highlight(row):
+        cor = 'background-color: #FDEDEC' if row['Status'] == '⚠️ Divergente' else ''
+        return [cor] * len(row)
+
+    styled = comp.style.apply(_highlight, axis=1).format({
+        nome_a: '{:,.0f}', nome_b: '{:,.0f}',
+        'Diferença (B−A)': '{:,.0f}', 'Diferença (%)': '{:+.2f}%',
+    })
+    st.dataframe(styled, hide_index=True, use_container_width=True)
+
+    # ── Download ───────────────────────────────────────────────────────────
+    csv_comp = comp.to_csv(index=False, sep=';').encode('utf-8-sig')
+    st.download_button(
+        '⬇️ Baixar Fechamento (CSV)',
+        data=csv_comp,
+        file_name='fechamento_rima.csv',
+        mime='text/csv'
+    )
+
+
+# ─────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────
 
@@ -744,7 +920,10 @@ def main():
     uploaded_file = st.file_uploader("Escolha um arquivo CSV", type="csv")
 
     if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file, sep=';', encoding='utf-8')
+        # keep_default_na=False + na_values=['']: apenas células realmente vazias
+        # viram NaN. Textos como 'N/A', 'NA', 'NULL' são preservados como string
+        # (antes o pandas os convertia em nulo e o validador acusava CAMPO VAZIO).
+        df = read_rima_csv(uploaded_file)
         df = validate_passenger_count(df)
         df = validate_movement_times(df)
         operations_by_date, passengers_by_date, occupancy_by_aircraft = process_flight_data(df)
@@ -752,13 +931,14 @@ def main():
         _, df_with_ponte, _, _ = create_ponte_chart(df)
         df['PONTE_LABEL'] = df_with_ponte['PONTE_LABEL']
 
-        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
             "Operações & Passageiros",
             "Análise de Ocupação",
             "Validação Aviação Geral",
             "Detalhes das Violações",
             "Uso de Ponte de Embarque",
-            "✅ Validação de Campos",          # ← nova aba
+            "✅ Validação de Campos",
+            "🔁 Fechamento / Conciliação",     # ← nova aba
         ])
 
         with tab1:
@@ -910,6 +1090,10 @@ def main():
         # ── Nova aba 6 ─────────────────────────────────────────────────────
         with tab6:
             render_tab_campos(df)
+
+        # ── Nova aba 7 ─────────────────────────────────────────────────────
+        with tab7:
+            render_tab_fechamento(df)
 
         # ── Estatísticas Gerais ────────────────────────────────────────────
         st.subheader('Estatísticas Gerais')
