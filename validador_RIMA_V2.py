@@ -272,19 +272,24 @@ def validate_fields(df: pd.DataFrame) -> pd.DataFrame:
         # ── 15. Consistência NATUREZA x AERONAVE_MARCAS ──────────────────────
         # Matrícula brasileira começa com PS-, PP-, PR-, PT-, PU-.
         # Aeronaves da Força Aérea Brasileira (prefixo FAB) também são domésticas.
-        marcas = str(row.get('AERONAVE_MARCAS', '') or '').strip().upper()
-        natureza = str(row.get('NATUREZA', '') or '').strip().upper()
-        br_prefix = marcas[:2] in ('PS', 'PP', 'PR', 'PT', 'PU') or marcas.startswith('FAB')
-        if natureza == 'D' and marcas and not br_prefix:
-            add_error(idx, 'NATUREZA', CAMPOS_OBRIGATORIOS.get('NATUREZA', 'Natureza'),
-                      natureza, 'INCONSISTÊNCIA',
-                      f"NATUREZA='D' (doméstico) mas matrícula '{marcas}' parece estrangeira.")
-        if natureza == 'I' and marcas and br_prefix:
-            # NATUREZA='I' com matrícula BR é possível (fretamento p/ exterior),
-            # então apenas aviso, não erro.
-            add_error(idx, 'NATUREZA', CAMPOS_OBRIGATORIOS.get('NATUREZA', 'Natureza'),
-                      natureza, 'AVISO',
-                      f"NATUREZA='I' com matrícula brasileira '{marcas}' — verificar se é fretamento internacional.")
+        # OBS: desconsiderada para Aviação Geral (operador 'GERAL'), pois
+        # matrículas privadas/estrangeiras não seguem o padrão de prefixos e
+        # gerariam falsos positivos de inconsistência.
+        operador = str(row.get('AERONAVE_OPERADOR', '') or '').strip().upper()
+        if operador != 'GERAL':
+            marcas = str(row.get('AERONAVE_MARCAS', '') or '').strip().upper()
+            natureza = str(row.get('NATUREZA', '') or '').strip().upper()
+            br_prefix = marcas[:2] in ('PS', 'PP', 'PR', 'PT', 'PU') or marcas.startswith('FAB')
+            if natureza == 'D' and marcas and not br_prefix:
+                add_error(idx, 'NATUREZA', CAMPOS_OBRIGATORIOS.get('NATUREZA', 'Natureza'),
+                          natureza, 'INCONSISTÊNCIA',
+                          f"NATUREZA='D' (doméstico) mas matrícula '{marcas}' parece estrangeira.")
+            if natureza == 'I' and marcas and br_prefix:
+                # NATUREZA='I' com matrícula BR é possível (fretamento p/ exterior),
+                # então apenas aviso, não erro.
+                add_error(idx, 'NATUREZA', CAMPOS_OBRIGATORIOS.get('NATUREZA', 'Natureza'),
+                          natureza, 'AVISO',
+                          f"NATUREZA='I' com matrícula brasileira '{marcas}' — verificar se é fretamento internacional.")
 
     errors_df = pd.DataFrame(errors, columns=[
         'LINHA', 'CAMPO', 'DESCRICAO_CAMPO', 'VALOR_ENCONTRADO', 'TIPO_ERRO', 'DETALHE'
