@@ -86,7 +86,7 @@ RE_OACI_OPERADOR = re.compile(r'^[A-Z0-9]{2,3}$')  # designador de operador
 
 
 # ─────────────────────────────────────────────────────────────
-# VALIDAÇÃO DE CAMPOS — NOVA FUNÇÃO PRINCIPAL
+# VALIDAÇÃO DE CAMPOS
 # ─────────────────────────────────────────────────────────────
 
 def validate_fields(df: pd.DataFrame) -> pd.DataFrame:
@@ -429,6 +429,92 @@ def render_tab_campos(df: pd.DataFrame):
         data=csv_erros,
         file_name='erros_campos_rima.csv',
         mime='text/csv'
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# ABA — CARGA SEM REGISTRO (operações comerciais sem carga)
+# ─────────────────────────────────────────────────────────────
+
+def render_tab_carga(df: pd.DataFrame):
+    """Aba exclusiva: operações comerciais (não Aviação Geral) sem carga, por dia."""
+    st.subheader('Carga — Operações Comerciais sem Carga (por dia)')
+    st.caption(
+        "Lista as operações que **não** são de Aviação Geral e que estão **sem carga** "
+        "(campo CARGA igual a 0, vazio ou nulo), detalhadas por dia."
+    )
+
+    d = df.copy()
+    # Garante CARGA numérica (pode vir como texto dependendo da origem)
+    d['CARGA_NUM'] = pd.to_numeric(d['CARGA'], errors='coerce').fillna(0)
+
+    comercial = d[d['OPERATION_TYPE'] != 'Aviação Geral'].copy()
+    sem_carga = comercial[comercial['CARGA_NUM'] <= 0].copy()
+
+    total_comercial = len(comercial)
+    total_sem_carga = len(sem_carga)
+
+    if total_comercial == 0:
+        st.info("Não há operações comerciais no arquivo.")
+        return
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Operações Comerciais", total_comercial)
+    col2.metric("Comerciais sem Carga", total_sem_carga,
+                f"{total_sem_carga / total_comercial * 100:.1f}%", delta_color="inverse")
+    col3.metric("Comerciais com Carga", total_comercial - total_sem_carga)
+
+    if total_sem_carga == 0:
+        st.success("✅ Todas as operações comerciais possuem carga registrada.")
+        return
+
+    st.markdown('---')
+
+    # ── Resumo por dia ──
+    sem_carga['DIA'] = sem_carga['CALCO_DATA'].dt.strftime('%d/%m/%Y')
+    por_dia = (
+        sem_carga.groupby('DIA')
+        .agg(Operacoes_sem_Carga=('VOO_NUMERO', 'count'),
+             Passageiros=('TOTAL_PAX', 'sum'))
+        .reset_index()
+    )
+    por_dia['_ord'] = pd.to_datetime(por_dia['DIA'], format='%d/%m/%Y')
+    por_dia = por_dia.sort_values('_ord').drop(columns='_ord')
+
+    fig = px.bar(
+        por_dia, x='DIA', y='Operacoes_sem_Carga',
+        title='Operações Comerciais sem Carga por Dia',
+        template='plotly_white', text='Operacoes_sem_Carga',
+    )
+    fig.update_traces(marker_color='#C0392B', textposition='outside')
+    fig.update_layout(
+        plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
+        font=dict(color='#2C3E50'), title_font_color='#2C3E50',
+        xaxis_title='Data', yaxis_title='Nº de Operações sem Carga'
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.write('#### Resumo por Dia')
+    por_dia_show = por_dia.rename(columns={
+        'DIA': 'Data',
+        'Operacoes_sem_Carga': 'Operações sem Carga',
+        'Passageiros': 'Total de Passageiros'
+    })
+    st.dataframe(por_dia_show, hide_index=True, use_container_width=True)
+
+    st.write('#### Detalhamento das Operações sem Carga')
+    cols_show = ['DIA', 'VOO_NUMERO', 'AERONAVE_OPERADOR', 'AERONAVE_MARCAS',
+                 'AERONAVE_TIPO', 'SERVICE_TYPE', 'TOTAL_PAX', 'CARGA', 'CORREIO']
+    cols_avail = [c for c in cols_show if c in sem_carga.columns]
+    detalhe = (sem_carga[cols_avail]
+               .rename(columns={'DIA': 'Data'})
+               .sort_values(['Data', 'VOO_NUMERO']))
+    st.dataframe(detalhe, hide_index=True, use_container_width=True)
+
+    csv = detalhe.to_csv(index=False, sep=';').encode('utf-8-sig')
+    st.download_button(
+        '⬇️ Baixar Operações sem Carga (CSV)',
+        data=csv, file_name='comerciais_sem_carga.csv', mime='text/csv'
     )
 
 
@@ -927,14 +1013,15 @@ def main():
         _, df_with_ponte, _, _ = create_ponte_chart(df)
         df['PONTE_LABEL'] = df_with_ponte['PONTE_LABEL']
 
-        tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
             "Operações & Passageiros",
             "Análise de Ocupação",
             "Validação Aviação Geral",
             "Detalhes das Violações",
             "Uso de Ponte de Embarque",
             "✅ Validação de Campos",
-            "🔁 Fechamento / Conciliação",     # ← nova aba
+            "🔁 Fechamento / Conciliação",
+            "📦 Carga sem Registro",           # ← nova aba
         ])
 
         with tab1:
@@ -1083,13 +1170,17 @@ def main():
             else:
                 st.success("✅ Todos os registros possuem valor válido no campo PONTE_CONECTOR_REMOTA.")
 
-        # ── Nova aba 6 ─────────────────────────────────────────────────────
+        # ── Aba 6 ──────────────────────────────────────────────────────────
         with tab6:
             render_tab_campos(df)
 
-        # ── Nova aba 7 ─────────────────────────────────────────────────────
+        # ── Aba 7 ──────────────────────────────────────────────────────────
         with tab7:
             render_tab_fechamento(df)
+
+        # ── Aba 8 (nova) ───────────────────────────────────────────────────
+        with tab8:
+            render_tab_carga(df)
 
         # ── Estatísticas Gerais ────────────────────────────────────────────
         st.subheader('Estatísticas Gerais')
