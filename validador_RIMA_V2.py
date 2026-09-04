@@ -50,6 +50,7 @@ CAMPOS_OBRIGATORIOS = {
     'CABECEIRA': 'Cabeceira (Campo 16)',
     'BOX': 'Box/Posição Pátio (Campo 17)',
     'PONTE_CONECTOR_REMOTA': 'Ponte/Conector (Campo 18)',
+    'PONTE_CONECTOR_REMOTO': 'Ponte/Conector (Campo 18)',
     'TERMINAL': 'Terminal (Campo 19)',
     'PAX_LOCAL': 'PAX Local (Campo 20)',
     'PAX_CONEXAO_DOMESTICO': 'PAX Conexão Doméstico (Campo 21)',
