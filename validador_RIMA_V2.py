@@ -32,6 +32,10 @@ PONTE_COLORS = {
     'Sem Passageiros pelo Terminal': '#95A5A6'
 }
 
+# SERVICE_TYPE considerados no cálculo da taxa de ocupação
+# (J = regular pax, C = charter pax, G = suplementar pax)
+SERVICE_TYPES_OCUPACAO = {'J', 'C', 'G'}
+
 # Aeroportos classe I e II sem ponte de embarque: a análise de ponte/remoto
 # (Campo 18) não se aplica. Identificados pelo prefixo do nome do arquivo.
 AEROPORTOS_SEM_PONTE = {
@@ -676,9 +680,12 @@ def generate_validation_report(df, sem_ponte=False):
 def validate_passenger_count(df):
     df['AIRCRAFT_CAPACITY'] = df['AERONAVE_TIPO'].map(AIRCRAFT_CAPACITY)
     df['TOTAL_PAX'] = df['PAX_LOCAL'] + df['PAX_CONEXAO_DOMESTICO'] + df['PAX_CONEXAO_INTERNACIONAL']
+    # Taxa de ocupação: apenas voos regulares/charter de passageiros (J, C, G)
+    service = df['SERVICE_TYPE'].fillna('').astype(str).str.strip().str.upper()
+    df['OCUPACAO_ELEGIVEL'] = service.isin(SERVICE_TYPES_OCUPACAO)
     df['OCCUPANCY_RATE'] = df.apply(
         lambda row: (row['TOTAL_PAX'] / row['AIRCRAFT_CAPACITY'] * 100)
-        if pd.notnull(row['AIRCRAFT_CAPACITY']) and row['AIRCRAFT_CAPACITY'] > 0
+        if row['OCUPACAO_ELEGIVEL'] and pd.notnull(row['AIRCRAFT_CAPACITY']) and row['AIRCRAFT_CAPACITY'] > 0
         else None, axis=1
     )
     df['EXCEEDS_CAPACITY'] = False
@@ -723,7 +730,7 @@ def process_flight_data(df):
     df = df.dropna(subset=['CALCO_DATA'])
     operations_by_date = df.groupby(['CALCO_DATA', 'OPERATION_TYPE']).size().reset_index(name='OPERATIONS_COUNT')
     passengers_by_date = df.groupby('CALCO_DATA')['TOTAL_PAX'].sum().reset_index()
-    occupancy_by_aircraft = df[df['AIRCRAFT_CAPACITY'].notna()].groupby('AERONAVE_TIPO').agg({
+    occupancy_by_aircraft = df[df['OCCUPANCY_RATE'].notna()].groupby('AERONAVE_TIPO').agg({
         'OCCUPANCY_RATE': 'mean', 'TOTAL_PAX': 'sum', 'AIRCRAFT_CAPACITY': 'first'
     }).reset_index()
     occupancy_by_aircraft = occupancy_by_aircraft.sort_values('OCCUPANCY_RATE', ascending=True)
@@ -1206,7 +1213,11 @@ def main():
                 st.metric("Total de Correio (kg)", f"{df['CORREIO'].sum():,.0f}")
 
         with tab2:
-            st.plotly_chart(create_occupancy_chart(occupancy_by_aircraft), use_container_width=True)
+            st.caption("Considera apenas operações com SERVICE_TYPE **J**, **C** ou **G**.")
+            if occupancy_by_aircraft.empty:
+                st.info("Nenhuma operação com SERVICE_TYPE J, C ou G e capacidade cadastrada.")
+            else:
+                st.plotly_chart(create_occupancy_chart(occupancy_by_aircraft), use_container_width=True)
             avg_occupancy = df[df['OCCUPANCY_RATE'].notna()]['OCCUPANCY_RATE'].mean()
             st.metric("Taxa Média de Ocupação", f"{avg_occupancy:.1f}%")
 
