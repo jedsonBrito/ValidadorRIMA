@@ -1108,22 +1108,47 @@ def montar_planilha_inconsistencias(df: pd.DataFrame, erros_campos: pd.DataFrame
                  + [len(d) for _, d in abas],
     })
 
+    abas_com_dados = [(nome[:31], d) for nome, d in abas if len(d) > 0]
     buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-        resumo.to_excel(writer, sheet_name='Resumo', index=False)
-        for nome, d in abas:
-            if len(d) > 0:
-                d.to_excel(writer, sheet_name=nome[:31], index=False)
-    return buffer.getvalue(), resumo
+    engine = _engine_excel()
+    if engine:
+        with pd.ExcelWriter(buffer, engine=engine) as writer:
+            resumo.to_excel(writer, sheet_name='Resumo', index=False)
+            for nome, d in abas_com_dados:
+                d.to_excel(writer, sheet_name=nome, index=False)
+        return buffer.getvalue(), resumo, 'xlsx'
+
+    # Sem biblioteca de Excel instalada: gera um .zip com um CSV por aba
+    import zipfile
+    with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as z:
+        z.writestr('Resumo.csv', resumo.to_csv(index=False, sep=';').encode('utf-8-sig'))
+        for nome, d in abas_com_dados:
+            z.writestr(f'{nome}.csv', d.to_csv(index=False, sep=';').encode('utf-8-sig'))
+    return buffer.getvalue(), resumo, 'zip'
+
+
+def _engine_excel():
+    """Retorna o primeiro motor de Excel disponível (openpyxl ou xlsxwriter), ou None."""
+    import importlib.util
+    for engine in ('openpyxl', 'xlsxwriter'):
+        if importlib.util.find_spec(engine) is not None:
+            return engine
+    return None
 
 
 def render_download_inconsistencias(df, erros_campos, nome_arquivo, sem_ponte):
     st.subheader('Planilha de Inconsistências')
-    arquivo_bytes, _ = montar_planilha_inconsistencias(df, erros_campos, nome_arquivo, sem_ponte)
+    arquivo_bytes, _, formato = montar_planilha_inconsistencias(df, erros_campos, nome_arquivo, sem_ponte)
     base = nome_arquivo.rsplit('.', 1)[0]
-    st.download_button('⬇️ Baixar planilha de inconsistências', data=arquivo_bytes,
-                       file_name=f"inconsistencias_{base}_{datetime.now():%Y%m%d_%H%M}.xlsx",
-                       mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    nome = f"inconsistencias_{base}_{datetime.now():%Y%m%d_%H%M}.{formato}"
+    if formato == 'xlsx':
+        st.download_button('⬇️ Baixar planilha de inconsistências', data=arquivo_bytes, file_name=nome,
+                           mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    else:
+        st.caption("Biblioteca de Excel (openpyxl) não instalada — as inconsistências saem em .zip com um CSV por aba. "
+                   "Adicione `openpyxl` ao requirements.txt para gerar o .xlsx.")
+        st.download_button('⬇️ Baixar inconsistências (.zip)', data=arquivo_bytes, file_name=nome,
+                           mime='application/zip')
 
 
 # ─────────────────────────────────────────────────────────────
