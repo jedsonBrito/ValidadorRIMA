@@ -62,6 +62,7 @@ CAMPOS_OBRIGATORIOS = {
     'CABECEIRA': 'Cabeceira (Campo 16)',
     'BOX': 'Box/Posição Pátio (Campo 17)',
     'PONTE_CONECTOR_REMOTA': 'Ponte/Conector (Campo 18)',
+    'PONTE_CONECTOR_REMOTO': 'Ponte/Conector (Campo 18)',
     'TERMINAL': 'Terminal (Campo 19)',
     'PAX_LOCAL': 'PAX Local (Campo 20)',
     'PAX_CONEXAO_DOMESTICO': 'PAX Conexão Doméstico (Campo 21)',
@@ -148,9 +149,13 @@ def validate_fields(df: pd.DataFrame, sem_ponte: bool = False) -> pd.DataFrame:
     """
     errors = []
 
+    # Número da linha no arquivo por posição (não pelo índice do DataFrame,
+    # que pode ser texto ou ter lacunas após filtros).
+    posicao = {idx: pos for pos, idx in enumerate(df.index)}
+
     def add_error(idx, campo, descricao, valor, tipo, detalhe):
         errors.append({
-            'LINHA': idx + 2,          # +2: 1-indexed + cabeçalho
+            'LINHA': posicao[idx] + 2,  # +2: 1-indexed + cabeçalho
             'CAMPO': campo,
             'DESCRICAO_CAMPO': descricao,
             'VALOR_ENCONTRADO': str(valor) if pd.notna(valor) else '(vazio)',
@@ -889,7 +894,8 @@ def read_rima_csv(file):
     """
     return pd.read_csv(
         file, sep=';', encoding='utf-8',
-        keep_default_na=False, na_values=['']
+        keep_default_na=False, na_values=[''],
+        index_col=False,  # evita que ';' no fim da linha vire índice e desloque as colunas
     )
 
 
