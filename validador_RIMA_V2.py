@@ -34,7 +34,9 @@ PONTE_COLORS = {
 
 # SERVICE_TYPE considerados no cálculo da taxa de ocupação
 # (J = regular pax, C = charter pax, G = suplementar pax)
-SERVICE_TYPES_OCUPACAO = {'J', 'C', 'G'}
+SERVICE_TYPES_PAX = {'J', 'C', 'G'}
+# Usados na taxa de ocupação, no RPE em branco e no aviso de PAX em outros serviços
+SERVICE_TYPES_OCUPACAO = SERVICE_TYPES_PAX
 
 # Aeroportos classe I e II sem ponte de embarque: a análise de ponte/remoto
 # (Campo 18) não se aplica. Identificados pelo prefixo do nome do arquivo.
@@ -641,7 +643,7 @@ def generate_validation_report(df, sem_ponte=False):
                 f"Total PAX: {row['TOTAL_PAX']}"
             )
     report.append("")
-    report.append("4. VALIDAÇÃO RPE EM BRANCO")
+    report.append("4. VALIDAÇÃO RPE EM BRANCO (Aviação Comercial, serviço J, C ou G)")
     report.append("-" * 20)
     rpe_violations = df[df['RPE_BRANCO_VIOLATION']].copy()
     report.append(f"Total de violações: {len(rpe_violations)}")
@@ -653,6 +655,19 @@ def generate_validation_report(df, sem_ponte=False):
                 f"Data: {row['CALCO_DATA'].strftime('%d/%m/%Y')} - "
                 f"Operador: {row['AERONAVE_OPERADOR']}"
             )
+    report.append("")
+    report.append("4.1 AVISO — PASSAGEIROS EM SERVIÇO QUE NÃO É J, C OU G")
+    report.append("-" * 20)
+    pax_outros = df[df['PAX_SERVICO_NAO_PAX']]
+    report.append(f"Total de avisos: {len(pax_outros)}")
+    for _, row in pax_outros.iterrows():
+        report.append(
+            f"Voo: {row['VOO_NUMERO']} - "
+            f"Data: {row['CALCO_DATA'].strftime('%d/%m/%Y')} - "
+            f"Operador: {row['AERONAVE_OPERADOR']} - "
+            f"Serviço: {row['SERVICE_TYPE']} - "
+            f"Total PAX: {int(row['TOTAL_PAX'])}"
+        )
     report.append("")
     report.append("5. USO DE PONTE DE EMBARQUE")
     report.append("-" * 20)
@@ -679,10 +694,16 @@ def generate_validation_report(df, sem_ponte=False):
 
 def validate_passenger_count(df):
     df['AIRCRAFT_CAPACITY'] = df['AERONAVE_TIPO'].map(AIRCRAFT_CAPACITY)
-    df['TOTAL_PAX'] = df['PAX_LOCAL'] + df['PAX_CONEXAO_DOMESTICO'] + df['PAX_CONEXAO_INTERNACIONAL']
-    # Taxa de ocupação: apenas voos regulares/charter de passageiros (J, C, G)
+    pax_cols = ['PAX_LOCAL', 'PAX_CONEXAO_DOMESTICO', 'PAX_CONEXAO_INTERNACIONAL']
+    pax = df[pax_cols].apply(pd.to_numeric, errors='coerce')
+    # Operação "em branco": nenhum dos campos de PAX preenchido
+    df['PAX_EM_BRANCO'] = pax.isna().all(axis=1)
+    df['TOTAL_PAX'] = pax.fillna(0).sum(axis=1)
     service = df['SERVICE_TYPE'].fillna('').astype(str).str.strip().str.upper()
-    df['OCUPACAO_ELEGIVEL'] = service.isin(SERVICE_TYPES_OCUPACAO)
+    servico_pax = service.isin(SERVICE_TYPES_PAX)
+    # Taxa de ocupação: só J/C/G com passageiros informados (desconsidera
+    # operações com PAX em branco ou zerado)
+    df['OCUPACAO_ELEGIVEL'] = servico_pax & ~df['PAX_EM_BRANCO'] & (df['TOTAL_PAX'] > 0)
     df['OCCUPANCY_RATE'] = df.apply(
         lambda row: (row['TOTAL_PAX'] / row['AIRCRAFT_CAPACITY'] * 100)
         if row['OCUPACAO_ELEGIVEL'] and pd.notnull(row['AIRCRAFT_CAPACITY']) and row['AIRCRAFT_CAPACITY'] > 0
@@ -697,10 +718,12 @@ def validate_passenger_count(df):
 
     # Regra de PAX > 0 continua restrita ao operador 'GERAL'
     df['GERAL_PAX_VIOLATION'] = (df['AERONAVE_OPERADOR'] == 'GERAL') & (df['TOTAL_PAX'] > 0)
-    df['RPE_BRANCO_VIOLATION'] = (
-        (~df['IS_AVIACAO_GERAL']) &
-        (df['TOTAL_PAX'] == 0) &
-        (~df['SERVICE_TYPE'].isin(['F', 'M', 'P', 'A', 'X', 'Y', 'Z']))
+    # RPE em branco: só Aviação Comercial com serviço de passageiros (J, C, G)
+    df['RPE_BRANCO_VIOLATION'] = (~df['IS_AVIACAO_GERAL']) & servico_pax & (df['TOTAL_PAX'] == 0)
+    # Aviso: passageiros informados em operação que não é J, C ou G
+    # (operador GERAL já é tratado em GERAL_PAX_VIOLATION)
+    df['PAX_SERVICO_NAO_PAX'] = (
+        (~servico_pax) & (df['TOTAL_PAX'] > 0) & (df['AERONAVE_OPERADOR'] != 'GERAL')
     )
     df['OPERATION_TYPE'] = df['IS_AVIACAO_GERAL'].map(
         {True: 'Aviação Geral', False: 'Aviação Comercial'}
@@ -1094,6 +1117,8 @@ def montar_planilha_inconsistencias(df: pd.DataFrame, erros_campos: pd.DataFrame
     geral = _sel(df[df['GERAL_PAX_VIOLATION']], ['TOTAL_PAX', 'PAX_LOCAL',
                                                   'PAX_CONEXAO_DOMESTICO', 'PAX_CONEXAO_INTERNACIONAL'])
     rpe = _sel(df[df['RPE_BRANCO_VIOLATION']], ['TOTAL_PAX'])
+    pax_outros = _sel(df[df['PAX_SERVICO_NAO_PAX']], ['TOTAL_PAX', 'PAX_LOCAL',
+                                                      'PAX_CONEXAO_DOMESTICO', 'PAX_CONEXAO_INTERNACIONAL'])
     horarios = _sel(df[df['HORARIO_INVALIDO']], ['MOVIMENTO_TIPO', 'CALCO_HORARIO',
                                                   'TOQUE_DATA', 'TOQUE_HORARIO', 'ERRO_VALIDACAO'])
     sem_carga = _sel(operacoes_comerciais_sem_carga(df), ['TOTAL_PAX', 'CARGA', 'CORREIO'])
@@ -1103,6 +1128,7 @@ def montar_planilha_inconsistencias(df: pd.DataFrame, erros_campos: pd.DataFrame
         ('Capacidade', capacidade),
         ('Aviacao Geral PAX', geral),
         ('RPE em Branco', rpe),
+        ('PAX fora de J-C-G', pax_outros),
         ('Horarios', horarios),
         ('Comerciais sem Carga', sem_carga),
     ]
@@ -1213,9 +1239,10 @@ def main():
                 st.metric("Total de Correio (kg)", f"{df['CORREIO'].sum():,.0f}")
 
         with tab2:
-            st.caption("Considera apenas operações com SERVICE_TYPE **J**, **C** ou **G**.")
+            st.caption("Considera apenas operações com SERVICE_TYPE **J**, **C** ou **G** e com passageiros preenchidos "
+                       "(operações com PAX em branco ou zerado são desconsideradas).")
             if occupancy_by_aircraft.empty:
-                st.info("Nenhuma operação com SERVICE_TYPE J, C ou G e capacidade cadastrada.")
+                st.info("Nenhuma operação com SERVICE_TYPE J, C ou G, passageiros preenchidos e capacidade cadastrada.")
             else:
                 st.plotly_chart(create_occupancy_chart(occupancy_by_aircraft), use_container_width=True)
             avg_occupancy = df[df['OCCUPANCY_RATE'].notna()]['OCCUPANCY_RATE'].mean()
@@ -1269,6 +1296,8 @@ def main():
             else:
                 st.info("Não foram encontradas violações de aviação geral.")
             st.write("### Detalhes de RPE em Branco")
+            st.caption("Considera apenas operações da Aviação Comercial com SERVICE_TYPE **J**, **C** ou **G** "
+                       "e sem passageiros informados.")
             rpe_branco_violations = df[df['RPE_BRANCO_VIOLATION']].copy()
             if not rpe_branco_violations.empty:
                 rpe_branco_violations['CALCO_DATA'] = rpe_branco_violations['CALCO_DATA'].dt.strftime('%d/%m/%Y')
@@ -1284,12 +1313,31 @@ def main():
                 operator_summary.columns = ['Operador', 'Tipo de Serviço', 'Número de Voos', 'Marcas das Aeronaves']
                 st.dataframe(operator_summary.sort_values(['Operador', 'Número de Voos'], ascending=[True, False]),
                              hide_index=True)
-                total_commercial = len(df[df['OPERATION_TYPE'] == 'Aviação Comercial'])
+                total_commercial = int(((df['OPERATION_TYPE'] == 'Aviação Comercial') &
+                                        df['SERVICE_TYPE'].astype(str).str.strip().str.upper()
+                                        .isin(SERVICE_TYPES_PAX)).sum())
                 violation_percentage = (len(rpe_branco_violations) / total_commercial * 100) if total_commercial > 0 else 0
-                st.metric("Percentual de Voos Comerciais com RPE em Branco",
+                st.metric("Percentual de Voos Comerciais (J, C, G) com RPE em Branco",
                           f"{violation_percentage:.2f}%", delta_color="inverse")
             else:
                 st.info("Não foram encontradas violações de RPE em branco.")
+
+            st.write("### ⚠️ Passageiros em Operações que não são J, C ou G")
+            pax_outros = df[df['PAX_SERVICO_NAO_PAX']].copy()
+            if not pax_outros.empty:
+                st.warning(
+                    f"Foram encontradas **{len(pax_outros)}** operações com passageiros informados em "
+                    "SERVICE_TYPE diferente de J, C ou G. Verifique o código de serviço ou os campos de PAX."
+                )
+                pax_outros['CALCO_DATA'] = pax_outros['CALCO_DATA'].dt.strftime('%d/%m/%Y')
+                st.dataframe(
+                    pax_outros[[
+                        'CALCO_DATA', 'VOO_NUMERO', 'AERONAVE_OPERADOR', 'AERONAVE_MARCAS', 'AERONAVE_TIPO',
+                        'SERVICE_TYPE', 'TOTAL_PAX', 'PAX_LOCAL', 'PAX_CONEXAO_DOMESTICO', 'PAX_CONEXAO_INTERNACIONAL'
+                    ]].sort_values(['SERVICE_TYPE', 'CALCO_DATA']), hide_index=True
+                )
+            else:
+                st.success("✅ Nenhuma operação fora de J, C ou G com passageiros informados.")
 
         with tab5:
             st.subheader('Uso de Ponte de Embarque (Campo 18 – PONTE_CONECTOR_REMOTO)')
@@ -1367,7 +1415,7 @@ def main():
 
         # ── Estatísticas Gerais ────────────────────────────────────────────
         st.subheader('Estatísticas Gerais')
-        col1, col2, col3, col4, col5 = st.columns(5)
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
         with col1:
             st.metric("Total de Operações", len(df))
         with col2:
@@ -1378,6 +1426,11 @@ def main():
             st.metric("Violações PAX Aviação Geral", int(df['GERAL_PAX_VIOLATION'].sum()), delta_color="inverse")
         with col5:
             st.metric("RPE em Branco", int(df['RPE_BRANCO_VIOLATION'].sum()), delta_color="inverse")
+        with col6:
+            st.metric("PAX fora de J/C/G", int(df['PAX_SERVICO_NAO_PAX'].sum()), delta_color="inverse")
+        if df['PAX_SERVICO_NAO_PAX'].any():
+            st.warning(f"⚠️ {int(df['PAX_SERVICO_NAO_PAX'].sum())} operação(ões) com passageiros em "
+                       "SERVICE_TYPE diferente de J, C ou G — detalhes na aba 'Detalhes das Violações'.")
 
         report_text = generate_validation_report(df, sem_ponte=sem_ponte)
         st.download_button(
