@@ -1,3 +1,5 @@
+import io
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -30,6 +32,16 @@ PONTE_COLORS = {
     'Sem Passageiros pelo Terminal': '#95A5A6'
 }
 
+# Aeroportos classe I e II sem ponte de embarque: a análise de ponte/remoto
+# (Campo 18) não se aplica. Identificados pelo prefixo do nome do arquivo.
+AEROPORTOS_SEM_PONTE = {
+    'SBJU', 'SBHT', 'SBCR', 'SBPP', 'SBKG', 'SBMA', 'SBSN', 'SBUR', 'SBMK'
+}
+
+# Equipamentos tratados como Aviação Geral quando operam com SERVICE_TYPE 'D'
+# (General Aviation no SSIM), mesmo que o operador não seja 'GERAL'.
+EQUIPAMENTOS_AG_SERVICE_D = {'C208'}
+
 # Campos obrigatórios conforme portaria (campo → descrição amigável)
 CAMPOS_OBRIGATORIOS = {
     'COD_RIMA': 'Cód. RIMA (Campo 1)',
@@ -59,6 +71,8 @@ CAMPOS_OBRIGATORIOS = {
     'CARGA': 'Carga kg (Campo 24)',
 }
 
+CAMPOS_PONTE = {'PONTE_CONECTOR_REMOTA', 'PONTE_CONECTOR_REMOTO'}
+
 # Campos opcionais (25 e 26) — validados se presentes, mas não exigidos
 CAMPOS_OPCIONAIS = {
     'RETORNO_ALTERNADO': 'Retorno/Alternado (Campo 25)',
@@ -87,14 +101,51 @@ RE_OACI_OPERADOR = re.compile(r'^[A-Z0-9]{2,3}$')  # designador de operador
 
 
 # ─────────────────────────────────────────────────────────────
+# REGRAS AUXILIARES
+# ─────────────────────────────────────────────────────────────
+
+def aeroporto_do_arquivo(nome_arquivo: str) -> str:
+    """Código OACI do aeroporto a partir do prefixo do nome do arquivo."""
+    return (nome_arquivo or '')[:4].upper()
+
+
+def aeroporto_sem_ponte(nome_arquivo: str) -> bool:
+    return aeroporto_do_arquivo(nome_arquivo) in AEROPORTOS_SEM_PONTE
+
+
+def valores_ponte_validos(sem_ponte: bool) -> list:
+    """Campo 18: aeroportos sem ponte só aceitam 3 (Modo Remoto) e 4 (Sem PAX pelo Terminal)."""
+    return [3, 4] if sem_ponte else VALORES_VALIDOS['PONTE_CONECTOR_REMOTA']
+
+
+def classificar_aviacao_geral(df: pd.DataFrame) -> pd.Series:
+    """
+    True quando a operação é de Aviação Geral:
+      - operador 'GERAL', ou
+      - equipamento C208 operando com SERVICE_TYPE 'D' (General Aviation).
+    """
+    def _col(nome):
+        if nome in df.columns:
+            return df[nome].fillna('').astype(str).str.strip().str.upper()
+        return pd.Series([''] * len(df), index=df.index)
+
+    operador = _col('AERONAVE_OPERADOR')
+    tipo = _col('AERONAVE_TIPO')
+    service = _col('SERVICE_TYPE')
+    return (operador == 'GERAL') | (tipo.isin(EQUIPAMENTOS_AG_SERVICE_D) & (service == 'D'))
+
+
+# ─────────────────────────────────────────────────────────────
 # VALIDAÇÃO DE CAMPOS
 # ─────────────────────────────────────────────────────────────
 
-def validate_fields(df: pd.DataFrame) -> pd.DataFrame:
+def validate_fields(df: pd.DataFrame, sem_ponte: bool = False) -> pd.DataFrame:
     """
     Executa todas as validações de campos (obrigatórios, formatos e regras
     de negócio dos metadados do RIMA). Retorna um DataFrame de erros com
     colunas: LINHA, CAMPO, DESCRICAO_CAMPO, VALOR_ENCONTRADO, TIPO_ERRO, DETALHE.
+
+    sem_ponte=True: aeroporto sem ponte de embarque — Campo 18 aceita apenas 3 ou 4.
     """
     errors = []
 
@@ -137,6 +188,9 @@ def validate_fields(df: pd.DataFrame) -> pd.DataFrame:
             return False
         h, m = s.split(':')
         return 0 <= int(h) <= 23 and 0 <= int(m) <= 59
+
+    is_ag_series = df['IS_AVIACAO_GERAL'] if 'IS_AVIACAO_GERAL' in df.columns \
+        else classificar_aviacao_geral(df)
 
     for idx, row in df.iterrows():
 
@@ -219,18 +273,21 @@ def validate_fields(df: pd.DataFrame) -> pd.DataFrame:
                       "Campo BOX deve ser preenchido com o identificador da posição ou 'N/A'.")
 
         # ── 10. Campo 18 – PONTE_CONECTOR_REMOTA: 1, 2, 3 ou 4 ──────────────
+        # Aeroportos sem ponte de embarque: apenas 3 ou 4.
         val = row.get('PONTE_CONECTOR_REMOTA')
         if not is_blank(val):
+            validos = valores_ponte_validos(sem_ponte)
+            esperado = '3 ou 4 (aeroporto sem ponte)' if sem_ponte else '1, 2, 3 ou 4'
             try:
                 v = int(float(str(val).strip()))
-                if v not in VALORES_VALIDOS['PONTE_CONECTOR_REMOTA']:
+                if v not in validos:
                     add_error(idx, 'PONTE_CONECTOR_REMOTA',
                               CAMPOS_OBRIGATORIOS.get('PONTE_CONECTOR_REMOTA', 'Ponte/Conector'),
-                              val, 'VALOR INVÁLIDO', f"Esperado 1, 2, 3 ou 4. Encontrado: '{val}'.")
+                              val, 'VALOR INVÁLIDO', f"Esperado {esperado}. Encontrado: '{val}'.")
             except ValueError:
                 add_error(idx, 'PONTE_CONECTOR_REMOTA',
                           CAMPOS_OBRIGATORIOS.get('PONTE_CONECTOR_REMOTA', 'Ponte/Conector'),
-                          val, 'FORMATO INVÁLIDO', f"Deve ser numérico (1-4). Encontrado: '{val}'.")
+                          val, 'FORMATO INVÁLIDO', f"Deve ser numérico ({esperado}). Encontrado: '{val}'.")
 
         # ── 11. Campo 19 – TERMINAL: N/A ou valor preenchido ─────────────────
         val = row.get('TERMINAL')
@@ -273,11 +330,10 @@ def validate_fields(df: pd.DataFrame) -> pd.DataFrame:
         # ── 15. Consistência NATUREZA x AERONAVE_MARCAS ──────────────────────
         # Matrícula brasileira começa com PS-, PP-, PR-, PT-, PU-.
         # Aeronaves da Força Aérea Brasileira (prefixo FAB) também são domésticas.
-        # OBS: desconsiderada para Aviação Geral (operador 'GERAL'), pois
-        # matrículas privadas/estrangeiras não seguem o padrão de prefixos e
-        # gerariam falsos positivos de inconsistência.
-        operador = str(row.get('AERONAVE_OPERADOR', '') or '').strip().upper()
-        if operador != 'GERAL':
+        # OBS: desconsiderada para Aviação Geral (operador 'GERAL' ou C208 com
+        # SERVICE_TYPE 'D'), pois matrículas privadas/estrangeiras não seguem o
+        # padrão de prefixos e gerariam falsos positivos de inconsistência.
+        if not bool(is_ag_series.loc[idx]):
             marcas = str(row.get('AERONAVE_MARCAS', '') or '').strip().upper()
             natureza = str(row.get('NATUREZA', '') or '').strip().upper()
             br_prefix = marcas[:2] in ('PS', 'PP', 'PR', 'PT', 'PU') or marcas.startswith('FAB')
@@ -298,16 +354,15 @@ def validate_fields(df: pd.DataFrame) -> pd.DataFrame:
     return errors_df
 
 
-def render_tab_campos(df: pd.DataFrame):
+def render_tab_campos(df: pd.DataFrame, erros_df: pd.DataFrame, sem_ponte: bool = False):
     """Renderiza a aba de Validação de Campos no Streamlit."""
     st.subheader('Validação de Campos — Obrigatórios, Formatos e Regras de Negócio')
     st.caption(
         "Baseado na Portaria nº 2.176/SRA/SIA e nos metadados do RIMA (Campos 1–26). "
         "Campos opcionais (25 e 26) são validados quando preenchidos."
     )
-
-    with st.spinner('Executando validações de campos...'):
-        erros_df = validate_fields(df)
+    if sem_ponte:
+        st.caption("ℹ️ Aeroporto sem ponte de embarque: o Campo 18 (Ponte/Conector) aceita apenas 3 ou 4.")
 
     total_erros = len(erros_df)
     total_linhas = len(df)
@@ -437,6 +492,13 @@ def render_tab_campos(df: pd.DataFrame):
 # ABA — CARGA SEM REGISTRO (operações comerciais sem carga)
 # ─────────────────────────────────────────────────────────────
 
+def operacoes_comerciais_sem_carga(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy()
+    d['CARGA_NUM'] = pd.to_numeric(d['CARGA'], errors='coerce').fillna(0)
+    comercial = d[d['OPERATION_TYPE'] != 'Aviação Geral']
+    return comercial[comercial['CARGA_NUM'] <= 0].copy()
+
+
 def render_tab_carga(df: pd.DataFrame):
     """Aba exclusiva: operações comerciais (não Aviação Geral) sem carga, por dia."""
     st.subheader('Carga — Operações Comerciais sem Carga (por dia)')
@@ -445,12 +507,8 @@ def render_tab_carga(df: pd.DataFrame):
         "(campo CARGA igual a 0, vazio ou nulo), detalhadas por dia."
     )
 
-    d = df.copy()
-    # Garante CARGA numérica (pode vir como texto dependendo da origem)
-    d['CARGA_NUM'] = pd.to_numeric(d['CARGA'], errors='coerce').fillna(0)
-
-    comercial = d[d['OPERATION_TYPE'] != 'Aviação Geral'].copy()
-    sem_carga = comercial[comercial['CARGA_NUM'] <= 0].copy()
+    comercial = df[df['OPERATION_TYPE'] != 'Aviação Geral']
+    sem_carga = operacoes_comerciais_sem_carga(df)
 
     total_comercial = len(comercial)
     total_sem_carga = len(sem_carga)
@@ -520,7 +578,7 @@ def render_tab_carga(df: pd.DataFrame):
 
 
 # ─────────────────────────────────────────────────────────────
-# FUNÇÕES ORIGINAIS (mantidas integralmente)
+# FUNÇÕES ORIGINAIS
 # ─────────────────────────────────────────────────────────────
 
 def format_date(date_val):
@@ -534,7 +592,7 @@ def format_date(date_val):
         return str(date_val)
 
 
-def generate_validation_report(df):
+def generate_validation_report(df, sem_ponte=False):
     report = []
     report.append("RELATÓRIO DE VALIDAÇÕES")
     report.append("=" * 50)
@@ -591,13 +649,15 @@ def generate_validation_report(df):
     report.append("5. USO DE PONTE DE EMBARQUE")
     report.append("-" * 20)
     if 'PONTE_LABEL' in df.columns:
+        if sem_ponte:
+            report.append("Aeroporto sem ponte de embarque — valores aceitos: 3 ou 4.")
         ponte_summary = df['PONTE_LABEL'].value_counts()
         total = len(df)
         for label, count in ponte_summary.items():
             pct = count / total * 100
             report.append(f"{label}: {count} operações ({pct:.1f}%)")
-        invalid_ponte = df['PONTE_CONECTOR_REMOTA'].isna().sum() + \
-                        (~df['PONTE_CONECTOR_REMOTA'].isin([1, 2, 3, 4])).sum()
+        ponte_num = pd.to_numeric(df['PONTE_CONECTOR_REMOTA'], errors='coerce')
+        invalid_ponte = int((~ponte_num.isin(valores_ponte_validos(sem_ponte))).sum())
         report.append(f"Valores inválidos/ausentes: {invalid_ponte}")
     report.append("")
     report.append("6. ESTATÍSTICAS FINAIS")
@@ -620,14 +680,19 @@ def validate_passenger_count(df):
     df['EXCEEDS_CAPACITY'] = False
     df.loc[df['AIRCRAFT_CAPACITY'].notna(), 'EXCEEDS_CAPACITY'] = \
         df.loc[df['AIRCRAFT_CAPACITY'].notna(), 'TOTAL_PAX'] > df.loc[df['AIRCRAFT_CAPACITY'].notna(), 'AIRCRAFT_CAPACITY']
+
+    # Aviação Geral = operador 'GERAL' OU C208 com SERVICE_TYPE 'D'
+    df['IS_AVIACAO_GERAL'] = classificar_aviacao_geral(df)
+
+    # Regra de PAX > 0 continua restrita ao operador 'GERAL'
     df['GERAL_PAX_VIOLATION'] = (df['AERONAVE_OPERADOR'] == 'GERAL') & (df['TOTAL_PAX'] > 0)
     df['RPE_BRANCO_VIOLATION'] = (
-        (df['AERONAVE_OPERADOR'] != 'GERAL') &
+        (~df['IS_AVIACAO_GERAL']) &
         (df['TOTAL_PAX'] == 0) &
         (~df['SERVICE_TYPE'].isin(['F', 'M', 'P', 'A', 'X', 'Y', 'Z']))
     )
-    df['OPERATION_TYPE'] = df['AERONAVE_OPERADOR'].apply(
-        lambda x: 'Aviação Geral' if x == 'GERAL' else 'Aviação Comercial'
+    df['OPERATION_TYPE'] = df['IS_AVIACAO_GERAL'].map(
+        {True: 'Aviação Geral', False: 'Aviação Comercial'}
     )
     return df
 
@@ -840,7 +905,6 @@ def compute_fechamento_summary(df: pd.DataFrame) -> dict:
     """
     d = df.copy()
 
-    # Garante numéricos (campos podem vir como string dependendo da origem)
     for c in ['PAX_LOCAL', 'PAX_CONEXAO_DOMESTICO', 'PAX_CONEXAO_INTERNACIONAL',
               'CORREIO', 'CARGA']:
         if c in d.columns:
@@ -919,7 +983,6 @@ def render_tab_fechamento(df_a: pd.DataFrame):
     resumo_b = compute_fechamento_summary(df_b)
     comp = build_fechamento_comparison(resumo_a, resumo_b, nome_a, nome_b)
 
-    # ── Indicadores de topo (apenas informativos — diferenças são normais) ──
     com_diferenca = int((comp['Status'] == 'Com diferença').sum())
     total_metricas = len(comp)
     col1, col2, col3 = st.columns(3)
@@ -937,7 +1000,6 @@ def render_tab_fechamento(df_a: pd.DataFrame):
 
     st.markdown('---')
 
-    # ── Métricas-chave lado a lado (com delta) ─────────────────────────────
     st.write('#### Principais Totais')
     destaques = ['ATM Total (movimentos)', 'PAX Total', 'Conexões Total',
                  'Carga (kg)', 'Correio (kg)']
@@ -952,7 +1014,6 @@ def render_tab_fechamento(df_a: pd.DataFrame):
 
     st.markdown('---')
 
-    # ── Gráfico comparativo ────────────────────────────────────────────────
     fig_df = comp.melt(
         id_vars=['Métrica'], value_vars=[nome_a, nome_b],
         var_name='Arquivo', value_name='Valor'
@@ -969,11 +1030,9 @@ def render_tab_fechamento(df_a: pd.DataFrame):
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    # ── Tabela detalhada ───────────────────────────────────────────────────
     st.write('#### Tabela Comparativa Detalhada')
 
     def _highlight(row):
-        # Destaque neutro (azul claro) — diferença não é erro
         cor = 'background-color: #EBF5FB' if row['Status'] == 'Com diferença' else ''
         return [cor] * len(row)
 
@@ -983,7 +1042,6 @@ def render_tab_fechamento(df_a: pd.DataFrame):
     })
     st.dataframe(styled, hide_index=True, use_container_width=True)
 
-    # ── Download ───────────────────────────────────────────────────────────
     csv_comp = comp.to_csv(index=False, sep=';').encode('utf-8-sig')
     st.download_button(
         '⬇️ Baixar Fechamento (CSV)',
@@ -991,6 +1049,76 @@ def render_tab_fechamento(df_a: pd.DataFrame):
         file_name='fechamento_rima.csv',
         mime='text/csv'
     )
+
+
+# ─────────────────────────────────────────────────────────────
+# PLANILHA DE INCONSISTÊNCIAS
+# ─────────────────────────────────────────────────────────────
+
+def _fmt_data(d: pd.DataFrame) -> pd.DataFrame:
+    d = d.copy()
+    if 'CALCO_DATA' in d.columns and pd.api.types.is_datetime64_any_dtype(d['CALCO_DATA']):
+        d['CALCO_DATA'] = d['CALCO_DATA'].dt.strftime('%d/%m/%Y')
+    return d
+
+
+def montar_planilha_inconsistencias(df: pd.DataFrame, erros_campos: pd.DataFrame,
+                                    nome_arquivo: str, sem_ponte: bool):
+    """
+    Gera um .xlsx com uma aba por tipo de inconsistência.
+    Retorna (bytes_do_arquivo, dataframe_resumo).
+    """
+    cols_base = ['CALCO_DATA', 'VOO_NUMERO', 'AERONAVE_OPERADOR', 'AERONAVE_MARCAS',
+                 'AERONAVE_TIPO', 'SERVICE_TYPE']
+
+    def _sel(d, extras):
+        cols = [c for c in cols_base + extras if c in d.columns]
+        return _fmt_data(d[cols])
+
+    capacidade = df[df['EXCEEDS_CAPACITY']].copy()
+    capacidade['EXCESSO_PAX'] = capacidade['TOTAL_PAX'] - capacidade['AIRCRAFT_CAPACITY']
+    capacidade = _sel(capacidade, ['AIRCRAFT_CAPACITY', 'TOTAL_PAX', 'EXCESSO_PAX'])
+
+    geral = _sel(df[df['GERAL_PAX_VIOLATION']], ['TOTAL_PAX', 'PAX_LOCAL',
+                                                  'PAX_CONEXAO_DOMESTICO', 'PAX_CONEXAO_INTERNACIONAL'])
+    rpe = _sel(df[df['RPE_BRANCO_VIOLATION']], ['TOTAL_PAX'])
+    horarios = _sel(df[df['HORARIO_INVALIDO']], ['MOVIMENTO_TIPO', 'CALCO_HORARIO',
+                                                  'TOQUE_DATA', 'TOQUE_HORARIO', 'ERRO_VALIDACAO'])
+    sem_carga = _sel(operacoes_comerciais_sem_carga(df), ['TOTAL_PAX', 'CARGA', 'CORREIO'])
+
+    abas = [
+        ('Validacao de Campos', erros_campos),
+        ('Capacidade', capacidade),
+        ('Aviacao Geral PAX', geral),
+        ('RPE em Branco', rpe),
+        ('Horarios', horarios),
+        ('Comerciais sem Carga', sem_carga),
+    ]
+
+    resumo = pd.DataFrame({
+        'Item': ['Arquivo analisado', 'Aeroporto', 'Total de operações',
+                 'Análise de ponte (Campo 18)'] + [nome for nome, _ in abas],
+        'Valor': [nome_arquivo, aeroporto_do_arquivo(nome_arquivo), len(df),
+                  'Aeroporto sem ponte — aceita apenas 3 ou 4' if sem_ponte else 'Aceita 1, 2, 3 ou 4']
+                 + [len(d) for _, d in abas],
+    })
+
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        resumo.to_excel(writer, sheet_name='Resumo', index=False)
+        for nome, d in abas:
+            if len(d) > 0:
+                d.to_excel(writer, sheet_name=nome[:31], index=False)
+    return buffer.getvalue(), resumo
+
+
+def render_download_inconsistencias(df, erros_campos, nome_arquivo, sem_ponte):
+    st.subheader('Planilha de Inconsistências')
+    arquivo_bytes, _ = montar_planilha_inconsistencias(df, erros_campos, nome_arquivo, sem_ponte)
+    base = nome_arquivo.rsplit('.', 1)[0]
+    st.download_button('⬇️ Baixar planilha de inconsistências', data=arquivo_bytes,
+                       file_name=f"inconsistencias_{base}_{datetime.now():%Y%m%d_%H%M}.xlsx",
+                       mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1003,9 +1131,9 @@ def main():
     uploaded_file = st.file_uploader("Escolha um arquivo CSV", type="csv")
 
     if uploaded_file is not None:
-        # keep_default_na=False + na_values=['']: apenas células realmente vazias
-        # viram NaN. Textos como 'N/A', 'NA', 'NULL' são preservados como string
-        # (antes o pandas os convertia em nulo e o validador acusava CAMPO VAZIO).
+        nome_arquivo = uploaded_file.name
+        sem_ponte = aeroporto_sem_ponte(nome_arquivo)
+
         df = read_rima_csv(uploaded_file)
         df = validate_passenger_count(df)
         df = validate_movement_times(df)
@@ -1013,6 +1141,13 @@ def main():
         geral_validation_fig, invalid_geral_flights = create_geral_validation_chart(df)
         _, df_with_ponte, _, _ = create_ponte_chart(df)
         df['PONTE_LABEL'] = df_with_ponte['PONTE_LABEL']
+
+        with st.spinner('Executando validações de campos...'):
+            erros_campos = validate_fields(df, sem_ponte=sem_ponte)
+
+        if sem_ponte:
+            st.info(f"ℹ️ {aeroporto_do_arquivo(nome_arquivo)}: aeroporto sem ponte de embarque — "
+                    "no Campo 18 (Ponte/Conector) só são aceitos os valores 3 e 4.")
 
         tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
             "Operações & Passageiros",
@@ -1022,7 +1157,7 @@ def main():
             "Uso de Ponte de Embarque",
             "✅ Validação de Campos",
             "🔁 Fechamento / Conciliação",
-            "📦 Carga sem Registro",           # ← nova aba
+            "📦 Carga sem Registro",
         ])
 
         with tab1:
@@ -1108,7 +1243,7 @@ def main():
                 operator_summary.columns = ['Operador', 'Tipo de Serviço', 'Número de Voos', 'Marcas das Aeronaves']
                 st.dataframe(operator_summary.sort_values(['Operador', 'Número de Voos'], ascending=[True, False]),
                              hide_index=True)
-                total_commercial = len(df[df['AERONAVE_OPERADOR'] != 'GERAL'])
+                total_commercial = len(df[df['OPERATION_TYPE'] == 'Aviação Comercial'])
                 violation_percentage = (len(rpe_branco_violations) / total_commercial * 100) if total_commercial > 0 else 0
                 st.metric("Percentual de Voos Comerciais com RPE em Branco",
                           f"{violation_percentage:.2f}%", delta_color="inverse")
@@ -1117,11 +1252,19 @@ def main():
 
         with tab5:
             st.subheader('Uso de Ponte de Embarque (Campo 18 – PONTE_CONECTOR_REMOTO)')
+            validos = valores_ponte_validos(sem_ponte)
+            validos_txt = ' ou '.join(str(v) for v in validos) if sem_ponte else '1, 2, 3 ou 4'
             st.caption(
                 "Conforme Portaria nº 2.176/SRA/SIA, de 17.07.2019: "
                 "**1** = Ponte de Embarque | **2** = Conector Remoto Acessível | "
                 "**3** = Modo Remoto | **4** = Sem Passageiros pelo Terminal"
             )
+            if sem_ponte:
+                st.info(
+                    f"O aeroporto **{aeroporto_do_arquivo(nome_arquivo)}** não possui ponte de embarque "
+                    "(classe I/II): os únicos valores aceitos são **3** (Modo Remoto) e "
+                    "**4** (Sem Passageiros pelo Terminal)."
+                )
             filtro_tipo = st.radio("Filtrar por tipo de operação:",
                                    ["Todas as Operações", "Aviação Comercial", "Aviação Geral"],
                                    horizontal=True, key="ponte_filtro")
@@ -1134,14 +1277,14 @@ def main():
             else:
                 df_ponte = df.copy()
                 title_suffix = ''
-            ponte_fig_filtrado, df_ponte_filtrado, invalid_ponte_count_filtrado, ponte_counts_filtrado = \
+            ponte_fig_filtrado, df_ponte_filtrado, _, ponte_counts_filtrado = \
                 create_ponte_chart(df_ponte, title_suffix=title_suffix)
             total_ops = len(df_ponte)
             col1, col2, col3, col4 = st.columns(4)
-            for col, (label, _) in zip(
+            for col, label in zip(
                 [col1, col2, col3, col4],
-                [('Ponte de Embarque', ''), ('Conector Remoto Acessível', ''),
-                 ('Modo Remoto', ''), ('Sem Passageiros pelo Terminal', '')]
+                ['Ponte de Embarque', 'Conector Remoto Acessível',
+                 'Modo Remoto', 'Sem Passageiros pelo Terminal']
             ):
                 count = ponte_counts_filtrado.loc[ponte_counts_filtrado['Modalidade'] == label, 'Quantidade'].values
                 count_val = int(count[0]) if len(count) > 0 else 0
@@ -1156,12 +1299,13 @@ def main():
             ponte_detail['Percentual (%)'] = (ponte_detail['Quantidade'] / total_ops * 100).round(2)
             ponte_detail = ponte_detail.sort_values('Quantidade', ascending=False).reset_index(drop=True)
             st.dataframe(ponte_detail, hide_index=True, use_container_width=True)
-            if invalid_ponte_count_filtrado > 0:
+
+            invalid_rows = df_ponte_filtrado[~df_ponte_filtrado['PONTE_CONECTOR_REMOTA'].isin(validos)].copy()
+            if len(invalid_rows) > 0:
                 st.warning(
-                    f"⚠️ Foram encontrados **{invalid_ponte_count_filtrado}** registros com valor inválido ou ausente "
-                    f"no campo PONTE_CONECTOR_REMOTA (esperado: 1, 2, 3 ou 4)."
+                    f"⚠️ Foram encontrados **{len(invalid_rows)}** registros com valor inválido ou ausente "
+                    f"no campo PONTE_CONECTOR_REMOTA (esperado: {validos_txt})."
                 )
-                invalid_rows = df_ponte_filtrado[df_ponte_filtrado['PONTE_LABEL'].isna()].copy()
                 if 'CALCO_DATA' in invalid_rows.columns:
                     invalid_rows['CALCO_DATA'] = invalid_rows['CALCO_DATA'].dt.strftime('%d/%m/%Y')
                 st.write("#### Registros com Valor Inválido/Ausente")
@@ -1171,15 +1315,12 @@ def main():
             else:
                 st.success("✅ Todos os registros possuem valor válido no campo PONTE_CONECTOR_REMOTA.")
 
-        # ── Aba 6 ──────────────────────────────────────────────────────────
         with tab6:
-            render_tab_campos(df)
+            render_tab_campos(df, erros_campos, sem_ponte=sem_ponte)
 
-        # ── Aba 7 ──────────────────────────────────────────────────────────
         with tab7:
             render_tab_fechamento(df)
 
-        # ── Aba 8 (nova) ───────────────────────────────────────────────────
         with tab8:
             render_tab_carga(df)
 
@@ -1197,13 +1338,16 @@ def main():
         with col5:
             st.metric("RPE em Branco", int(df['RPE_BRANCO_VIOLATION'].sum()), delta_color="inverse")
 
-        report_text = generate_validation_report(df)
+        report_text = generate_validation_report(df, sem_ponte=sem_ponte)
         st.download_button(
             label="Baixar Relatório de Validações",
             data=report_text,
             file_name="relatorio_validacoes.txt",
             mime="text/plain",
         )
+
+        st.markdown('---')
+        render_download_inconsistencias(df, erros_campos, nome_arquivo, sem_ponte)
 
 
 if __name__ == "__main__":
